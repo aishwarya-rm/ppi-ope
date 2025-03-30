@@ -2,22 +2,27 @@ import tensorflow as tf
 import numpy as np
 from collections import deque
 import random
+import time
 import gym
 from gym import wrappers
 from VLBM import *
 import os
 import tensorflow_probability as tfp
-import multiprocessing as mp
+import multiprocessing
 import os
 import d4rl
 import json
 import pandas as pd
 import argparse
+import tqdm
 import collections
+import concurrent.futures
+from multiprocessing import Manager
 
 slim = tf.contrib.slim
 rnn = tf.contrib.rnn
 tfd = tfp.distributions
+np.random.seed(42)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-no_gpu", dest='no_gpu', action='store_true', help="Train w/o using GPUs")
@@ -32,13 +37,20 @@ parser.add_argument("-batch_size", type=int, help="Set minibatch size DEFAULT=64
 parser.add_argument("-num_branch", type=int, help="Set number of branches for VLBM decoder DEFAULT=10", default=10)
 parser.add_argument("-code_size", type=int, help="Set dimension of the latent space DEFAULT=16", default=16)
 parser.add_argument("-beta", type=float, help="Set the constant C in the objective DEFAULT=1.0", default=1.)
-parser.add_argument("-env", type=str, help="Choose environment from {halfcheetah-medium-expert-v2, halfcheetah-medium-v2}. Use the other script to train on Ant, Hopper, Walker2d. DEFAULT=halfcheetah-medium-expert-v2", default='halfcheetah-medium-expert-v2')
+parser.add_argument("-env", type=str,
+                    help="Choose environment from {halfcheetah-medium-expert-v2, halfcheetah-medium-v2}. Use the other script to train on Ant, Hopper, Walker2d. DEFAULT=halfcheetah-medium-expert-v2",
+                    default='halfcheetah-medium-expert-v2')
 parser.add_argument("-val_interval", type=int, help="Validation interval DEFAULT=50", default=50)
 # Below are some constants that would not be changed
 parser.add_argument("-path", type=str, help="Path to checkpoint folder")
-parser.add_argument("-repeat", type=int, help="Set action repeat. Since we are training on offline trajectories, so this is not needed (always set to 1)", default=1)
-parser.add_argument("-max_episode_len", type=int, help="Maximum episode length, which is always 1000 for Gym-Mujoco environments", default=1000)
-parser.add_argument("-buffer_size", type=int, help="Maximum buffer size. Set to 3000 to make sure it can accomodate all offline trajectories used for training", default=3000)
+parser.add_argument("-repeat", type=int,
+                    help="Set action repeat. Since we are training on offline trajectories, so this is not needed (always set to 1)",
+                    default=1)
+parser.add_argument("-max_episode_len", type=int,
+                    help="Maximum episode length, which is always 1000 for Gym-Mujoco environments", default=1000)
+parser.add_argument("-buffer_size", type=int,
+                    help="Maximum buffer size. Set to 3000 to make sure it can accomodate all offline trajectories used for training",
+                    default=3000)
 
 
 def sequence_dataset(env, dataset=None, **kwargs):
@@ -79,7 +91,7 @@ def sequence_dataset(env, dataset=None, **kwargs):
             final_timestep = (episode_step == env._max_episode_steps - 1)
 
         for k in dataset:
-            if k.find("metadata")==-1:
+            if k.find("metadata") == -1:
                 data_[k].append(dataset[k][i])
 
         if done_bool or final_timestep:
@@ -92,24 +104,25 @@ def sequence_dataset(env, dataset=None, **kwargs):
 
         episode_step += 1
 
+
 def evaluate(ope_eval, graph_ope_eval, sess_ope_eval, *args):
-    
     # Validate and create checkpoints of VLBM during training
-    
-    (MAX_EPISODE_LEN, REPEAT, env_state_dim, env_action_dim, RANDOM_SEED, 
-    	obs_mean, obs_std, rew_mean, rew_std, rl_params) = args
-    
+
+    (MAX_EPISODE_LEN, REPEAT, env_state_dim, env_action_dim, RANDOM_SEED,
+     obs_mean, obs_std, rew_mean, rew_std, rl_params) = args
+
     with tf.io.gfile.GFile("./d4rl_policies.json", 'r') as f:
         policy_database = json.load(f)
 
-        policy_metadatas = [i for i in policy_database if i['task.task_names'][0].find(rl_params['env_name'].split("-")[0]+"-")!=-1]
-    
+        policy_metadatas = [i for i in policy_database if
+                            i['task.task_names'][0].find(rl_params['env_name'].split("-")[0] + "-") != -1]
+
     truths = [np.loadtxt("./truth_discounted/" + p["policy_path"] + ".txt")[0] for p in policy_metadatas]
-    
+
     pred = []
+
     class LearnedEnv(object):
         def __init__(self, model):
-
             self.model = model
 
         def reset(self):
@@ -137,34 +150,59 @@ def evaluate(ope_eval, graph_ope_eval, sess_ope_eval, *args):
             terminal = 0
 
             s = learned_env.reset()
-            s = s.reshape(env_state_dim)*obs_std + obs_mean
+            s = s.reshape(env_state_dim) * obs_std + obs_mean
             ep_reward = 0
 
             for j in range(MAX_EPISODE_LEN):
 
                 if j % REPEAT == 0:
-                    a, _ = policy.act(np.reshape(s, (env_state_dim,)), np.zeros((env_action_dim,)))
+                    a, _, _ = policy.act(np.reshape(s, (env_state_dim,)), np.zeros((env_action_dim,)))
                 s2, r, terminal, info = learned_env.step(a)
-                r = r*rew_std + rew_mean
-                s2 = s2.reshape(env_state_dim)*obs_std + obs_mean
+                r = r * rew_std + rew_mean
+                s2 = s2.reshape(env_state_dim) * obs_std + obs_mean
 
-                ep_reward += r*(GAMMA**j)
+                ep_reward += r * (GAMMA ** j)
 
                 s = s2
 
-                if terminal or j == MAX_EPISODE_LEN-1:
+                if terminal or j == MAX_EPISODE_LEN - 1:
                     ep_rewards += [ep_reward]
                     break
-                    
-        pred += [np.mean(ep_rewards)]
-    return np.mean(np.abs(np.asarray(truths)-np.asarray(pred)))
 
-def collect_calibration_dataset(target_policy_path, behavior_policy_path, ope_model, n_tries=100):
+        pred += [np.mean(ep_rewards)]
+    return np.mean(np.abs(np.asarray(truths) - np.asarray(pred)))
+
+
+def generate_trajectory(policy, env):
+    s = env.reset()
+    s = s.reshape(env_state_dim) * obs_std + obs_mean
+    ep_reward = 0
+    trajectory = [s]
+    trajectory_actions = []
+    terminal = 0
+    for j in range(MAX_EPISODE_LEN):
+        if j % REPEAT == 0:
+            a, _, _ = policy.act(np.reshape(s, (env_state_dim,)), np.zeros((env_action_dim,)))
+        trajectory_actions.append(a)
+        s2, r, terminal, info = env.step(a)
+        r = r * rew_std + rew_mean
+        s2 = s2.reshape(env_state_dim) * obs_std + obs_mean
+
+        ep_reward += r * (GAMMA ** j)
+
+        s = s2
+        trajectory.append(s)
+
+        if terminal or j == MAX_EPISODE_LEN - 1:
+            return ep_reward, trajectory, trajectory_actions
+
+
+def calculate_policy_value(target_policy_path, behavior_policy_path, ope_model, n_tries=100):
     # Returns a list of trajectories that are calibrated for this particular behavior and target policy
     ope_path = args.path
     ope_saver = ope_model.saver
-    with tf.Session(config=config, graph=graph_ope_models) as sess:
-        ope_saver.restore(sess, os.path.join(ope_path, "ope_best.ckpt"))
+    with tf.Session(config=config, graph=graph_ope_models) as sess_ope_model:
+        ope_saver.restore(sess_ope_model, os.path.join(ope_path, "ope_best.ckpt"))
 
     d4rl_qlearning = d4rl.qlearning_dataset(env)
 
@@ -204,67 +242,184 @@ def collect_calibration_dataset(target_policy_path, behavior_policy_path, ope_mo
     target_policy = D4RL_Policy(target_policy_path)
     behavior_policy = D4RL_Policy(behavior_policy_path)
 
-    # Generate a set of trajectories from the behavior policy
-    behavior_rewards = []
-    behavior_trajectories = []
-    for i in range(n_tries):
-        s = original_env.reset()
-        s = s.reshape(env_state_dim) * obs_std + obs_mean
-        ep_reward = 0
-        trajectory = [s]
-        terminal = 0
-        for j in range(MAX_EPISODE_LEN):
-            if j % REPEAT == 0:
-                a, _ = behavior_policy.act(np.reshape(s, (env_state_dim,)), np.zeros((env_action_dim,)))
-            s2, r, terminal, info = original_env.step(a)
-            r = r * rew_std + rew_mean
-            s2 = s2.reshape(env_state_dim) * obs_std + obs_mean
+    # Calculate the true value of the policy
+    true_target_rewards = []
+    for _, i in enumerate(tqdm.tqdm(range(n_tries))):
+        target_reward, _, _ = generate_trajectory(target_policy, original_env)
+        true_target_rewards.append(target_reward)
 
-            ep_reward += r * (GAMMA ** j)
+    # Generate a set of trajectories for the first term from target policy
+    first_term_target_rewards = []
+    for _, i in enumerate(tqdm.tqdm(range(n_tries))):  # TODO: Make this 100000
+        ep_reward, _, _ = generate_trajectory(target_policy, learned_env)
+        first_term_target_rewards.append(ep_reward)
 
-            s = s2
-            trajectory.append(s)
+    # Generate possible matching trajectories
+    # epsilon = 0.2
+    # predicted_returns = []
+    # actual_returns = []
+    # # Or alternatively generate trajectories until you reach a total calibration dataset size
+    # calibration_dataset_size = 100
+    # attempts = 0
+    # while len(predicted_returns) < calibration_dataset_size:
+    #     b_r, b_t = generate_trajectory(behavior_policy, original_env)
+    #     t_r, t_t = generate_trajectory(target_policy, learned_env)
+    #     attempts += 1
+    #     if (np.linalg.norm(t_t[0][:8] - b_t[0][:8]) < epsilon):
+    #         if (np.linalg.norm(t_t[-1][:8] - b_t[-1][:8]) < epsilon):  # First and last state are the same
+    #             predicted_returns.append(t_r)
+    #             actual_returns.append(b_r)
+    #     if attempts >= 4000:
+    #         break
 
-            if terminal or j == MAX_EPISODE_LEN - 1:
-                behavior_rewards += [ep_reward]
-                behavior_trajectories += trajectory
+    # Parallelize the calibration dataset generation:
+    epsilon = 0.2
+    calibration_dataset_size = 100
+    max_attempts = 4000
+
+    # Limit parallelism based on available CPU cores
+    max_workers = min(max_attempts, os.cpu_count())
+
+    def generate_and_check_trajectory(_):
+        """Generate trajectories and check the conditions in parallel."""
+        b_r, b_t, b_a = generate_trajectory(behavior_policy, original_env)
+        t_r, t_t, t_a = generate_trajectory(target_policy, learned_env)
+
+        if (np.linalg.norm(t_t[0][:8] - b_t[0][:8]) < epsilon):
+            if (np.linalg.norm(t_t[-1][:8] - b_t[-1][:8]) < epsilon):
+                return (t_r, t_t, t_a), (b_r, b_t, b_a)
+        return (0, [], []), (0, [], [])
+
+    def worker(task_queue, result_queue, attempt_counter, lock):
+        """Worker process that generates trajectories and sends valid results to result_queue."""
+        while True:
+            index = task_queue.get()
+            if index is None:  # Stop signal
                 break
 
-    # Generate a set of trajectories from the target policy
-    target_rewards = []
-    target_trajectories = []
-    for i in range(n_tries):
-        s = learned_env.reset()
-        s = s.reshape(env_state_dim) * obs_std + obs_mean
-        ep_reward = 0
-        trajectory = [s]
-        terminal = 0
-        for j in range(MAX_EPISODE_LEN):
-            if j % REPEAT == 0:
-                a, _ = target_policy.act(np.reshape(s, (env_state_dim,)), np.zeros((env_action_dim,)))
-            s2, r, terminal, info = learned_env.step(a)
-            r = r * rew_std + rew_mean
-            s2 = s2.reshape(env_state_dim) * obs_std + obs_mean
+            result = generate_and_check_trajectory(index)
 
-            ep_reward += r * (GAMMA ** j)
+            with lock:  # Ensure thread-safe update
+                attempt_counter.value += 1
 
-            s = s2
-            trajectory.append(s)
+            if result:
+                result_queue.put(result)
 
-            if terminal or j == MAX_EPISODE_LEN - 1:
-                target_rewards += [ep_reward]
-                target_trajectories += trajectory
+    def monitor_progress(attempt_counter, total_attempts, lock):
+        """Monitor and display progress based on attempts made."""
+        while True:
+            with lock:
+                current_attempts = attempt_counter.value
+
+            print(
+                f"Progress: {current_attempts}/{total_attempts} attempts ({(current_attempts / total_attempts) * 100:.2f}%)",
+                end='\r', flush=True)
+
+            if current_attempts >= total_attempts:
                 break
-    import ipdb; ipdb.set_trace()
-    # Matching criteria: You start in the same state, have the same end state, and maybe have the same reward?
-    # matching_trajectories = []
-    reward_difference = []
-    for (t_r, t_t, b_r, b_t) in zip(target_rewards, target_trajectories, behavior_rewards, behavior_trajectories):
-        # if t_r == b_r: # Rewards match
-        if (t_r[0].equals(b_r[0])) and (t_r[-1].equals(b_r[-1])): # First and last state are the same
-            reward_difference.append(b_r - t_r)
-    import ipdb; ipdb.set_trace()
-    return np.mean(reward_difference)
+
+            time.sleep(2)
+
+    def calculate_ips_product(t_t, t_a):
+        ips_vals = []
+        for i in range(len(t_a)):
+            ips_weight = np.log(target_policy.propensity_score(t_t[i], t_a[i])) - np.log(
+                behavior_policy.propensity_score(t_t[i], t_a[i]))
+            if np.isinf(ips_weight):  # when divide by zero happens
+                continue
+            else:
+                ips_vals.append(ips_weight)
+        return np.sum(ips_vals)  # TODO: not using exp here because this would explode. (is this okay)
+
+    parallelize = True
+    if parallelize:  # TODO: we need to figure out how to better parallelize this section. It takes forever.
+        task_queue = multiprocessing.Queue()
+        result_queue = multiprocessing.Queue()
+        attempt_counter = multiprocessing.Value('i', 0)  # Shared counter for attempts
+        lock = multiprocessing.Lock()  # Lock for safe updates
+
+        # Start worker processes
+        processes = []
+        for _ in range(max_workers):
+            p = multiprocessing.Process(target=worker, args=(task_queue, result_queue, attempt_counter, lock))
+            p.start()
+            processes.append(p)
+
+        # Fill task queue
+        for i in range(max_attempts):
+            task_queue.put(i)
+
+        # Collect results until calibration_dataset_size is reached
+        predicted_returns = []
+        actual_returns = []
+        predicted_ips_weights = []
+
+        # Start progress monitor in a separate process
+        progress_monitor = multiprocessing.Process(target=monitor_progress, args=(attempt_counter, max_attempts, lock))
+        progress_monitor.start()
+
+        while len(predicted_returns) < calibration_dataset_size and attempt_counter.value < max_attempts:
+            (t_r, t_t, t_a), (b_r, b_t, b_a) = result_queue.get(
+                timeout=5)  # Prevent infinite blocking # Change this to be 0 if it's empty
+            if len(t_t) > 0:
+                predicted_returns.append(t_r)
+                actual_returns.append(b_r)
+                predicted_ips_weights.append(
+                    calculate_ips_product(t_t, t_a))  # TODO: This was running into an exception?
+
+        # Stop progress monitor
+        progress_monitor.terminate()
+        progress_monitor.join()
+
+        # Stop workers
+        for _ in processes:
+            task_queue.put(None)  # Send stop signals
+
+        for p in processes:
+            p.join()
+
+        print(f"\nCollected {len(predicted_returns)} valid trajectories")
+    else:
+        predicted_returns = []
+        actual_returns = []
+        predicted_ips_weights = []
+        for i in range(max_attempts):
+            result = generate_and_check_trajectory(i)
+            if result is not None:
+                (t_r, t_t, t_a), (b_r, b_t, b_a) = result
+                predicted_returns.append(t_r)
+                actual_returns.append(b_r)
+                predicted_ips_weights.append(calculate_ips_product(t_t, t_a))
+            if len(predicted_returns) >= calibration_dataset_size:
+                break
+
+    print("Size of calibration dataset: " + str(
+        len(predicted_returns)))  # If this is around 50, we are maximally matching.
+
+    # Option 2: nearest neighbor?
+    IPS_weighting = True
+
+    if len(predicted_returns) == 0:
+        print("Cannot calculate quantiles")
+        return (0, 0), np.mean(true_target_rewards)
+    # Calculate quantiles over the calibration dataset rather than mean/sd
+    alpha = 0.1  # 90% coverage
+
+    if IPS_weighting:
+        ips_weighted_errors = []
+        for i in range(len(predicted_returns)):
+            ips_weighted_errors.append(predicted_ips_weights[i] * (actual_returns[i] - predicted_returns[i]))
+        import ipdb;
+        ipdb.set_trace()
+        return (np.mean(first_term_target_rewards) - np.quantile(ips_weighted_errors, 1 - alpha),
+                (np.mean(first_term_target_rewards) - np.quantile(ips_weighted_errors, alpha))), np.mean(
+            true_target_rewards)
+    else:
+        errors = []
+        for i in range(len(predicted_returns)):
+            errors.append(actual_returns[i] - predicted_returns[i])
+        return (np.mean(first_term_target_rewards) - np.quantile(errors, 1 - alpha),
+                (np.mean(first_term_target_rewards) - np.quantile(errors, alpha))), np.mean(true_target_rewards)
 
 
 if __name__ == '__main__':
@@ -276,7 +431,6 @@ if __name__ == '__main__':
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         config = tf.ConfigProto(log_device_placement=False)
-
 
     GAMMA = args.gamma
     MINIBATCH_SIZE_OPE = args.batch_size
@@ -291,9 +445,9 @@ if __name__ == '__main__':
     TRAIN = False
 
     MAX_EPISODE_LEN = args.max_episode_len
-    REPEAT = args.repeat # Action repeat is not needed since we are training on offline trajectories. So it's always set to 1.
+    REPEAT = args.repeat  # Action repeat is not needed since we are training on offline trajectories. So it's always set to 1.
     BUFFER_SIZE_OPE = args.buffer_size
-    BEST_MAE = 9999. # Used later for validation and checkpoint saving
+    BEST_MAE = 9999.  # Used later for validation and checkpoint saving
 
     ENV = args.env
 
@@ -312,14 +466,14 @@ if __name__ == '__main__':
     }
 
     file_appendix = (
-        "VLBM_" + rl_params['env_name'] + "_" + str(MAX_ITER)
-        + "iter_"
-        + str(OPE_LR) + "_"
-        + str(OPE_DS) + "_"
-        + str(OPE_DR) + "_"
-        + str(CODE_SIZE) + "_"
-        + str(BETA) + "_"
-        + str(RANDOM_SEED)
+            "VLBM_" + rl_params['env_name'] + "_" + str(MAX_ITER)
+            + "iter_"
+            + str(OPE_LR) + "_"
+            + str(OPE_DS) + "_"
+            + str(OPE_DR) + "_"
+            + str(CODE_SIZE) + "_"
+            + str(BETA) + "_"
+            + str(RANDOM_SEED)
     )
 
     graph_ope_models = tf.Graph()
@@ -374,7 +528,7 @@ if __name__ == '__main__':
                     )
 
                     # If exist checkpoints using same hyper-parameters, load it and train on top
-                    if os.path.exists("./rl_stats/"+file_appendix+".txt"):
+                    if os.path.exists("./rl_stats/" + file_appendix + ".txt"):
                         ope_model.saver.restore(
                             sess_ope_models,
                             os.path.join(
@@ -384,8 +538,7 @@ if __name__ == '__main__':
                             )
                         )
 
-                        for _k in range(iters_already_passed*MAX_EPISODE_LEN):
-
+                        for _k in range(iters_already_passed * MAX_EPISODE_LEN):
                             sess_ope_models.run(ope_model.global_step_increment)
 
                 with graph_ope_models_eval.as_default():
@@ -398,16 +551,13 @@ if __name__ == '__main__':
                         BETA, is_training=False
                     )
 
-
                 actor_noise = OrnsteinUhlenbeckActionNoise(mu=np.zeros(env_action_dim))
-
 
                 for i in range(iters_already_passed, MAX_ITER):
 
                     ep_elbo = []
 
                     if ope_model.replay_buffer.size > MINIBATCH_SIZE_OPE * 4:
-
 
                         batch = ope_model.replay_buffer.sample_batch(MINIBATCH_SIZE_OPE)
 
@@ -419,7 +569,7 @@ if __name__ == '__main__':
                         if np.isnan(ep_elbo[-1]):
                             break
 
-                        if (i+1) % args.val_interval == 0 and ope_model.replay_buffer.size > MINIBATCH_SIZE_OPE * 4:
+                        if (i + 1) % args.val_interval == 0 and ope_model.replay_buffer.size > MINIBATCH_SIZE_OPE * 4:
 
                             # Validate VLBM during training
                             mae = evaluate(
@@ -446,8 +596,7 @@ if __name__ == '__main__':
                                 )
                                 BEST_MAE = mae
 
-
-                    with open("./rl_stats/"+file_appendix+".txt", "a") as myfile:
+                    with open("./rl_stats/" + file_appendix + ".txt", "a") as myfile:
                         myfile.write(
                             '| Episode: {:d}  | ELBO: {:.4f} | \n'
                             .format(
@@ -455,7 +604,6 @@ if __name__ == '__main__':
                                 np.mean(ep_elbo),
                             )
                         )
-
 
                     print(
                         '| Episode: {:d}  | ELBO: {:.4f} | \n'
@@ -467,10 +615,7 @@ if __name__ == '__main__':
     else:
         with tf.io.gfile.GFile("./d4rl_policies.json", 'r') as f:
             policy_database = json.load(f)
-        policy_metadatas = [i for i in policy_database if
-                            i['task.task_names'][0].find(rl_params['env_name'].split("-")[0] + "-") != -1]
-        target_policy_path = policy_metadatas[0]['policy_path']
-        behavior_policy_path = policy_metadatas[1]['policy_path']  # Q: what is the behavior policy here?
+
         d4rl_qlearning = d4rl.qlearning_dataset(env)
         ope_path = args.path
         obs_mean = d4rl_qlearning['observations'].mean(0).astype(np.float32)
@@ -509,7 +654,29 @@ if __name__ == '__main__':
                         )
                     )
                 # This should calculate the calibration dataset, for a given target and behavior policy
-                calibration_dataset = collect_calibration_dataset(target_policy_path, behavior_policy_path, ope_model, 100)
+                policy_metadatas = [i for i in policy_database if
+                                    i['task.task_names'][0].find(rl_params['env_name'].split("-")[0] + "-") != -1]
+                # i_abridged = [0, 0, 1, 1, 1, 2, 3, 3, 3, 4, 5, 5, 6]
+                # j_abridged = [2, 4, 0, 2, 7, 0, 0, 4, 8, 5, 0, 8, 0]
+                # for kk in range(len(i_abridged)):
+                #     i = i_abridged[kk]
+                #     j = j_abridged[kk]
+                #     target_policy_path = policy_metadatas[i]['policy_path']
+                #     behavior_policy_path = policy_metadatas[j]['policy_path']
+                #     (lower_quantile, upper_quantile), policy_value = calculate_policy_value(target_policy_path, behavior_policy_path, ope_model, 100)
+                #     print("i: " + str(i) + " j: " + str(j) + " policy value: (" + str(lower_quantile) + "," + str(upper_quantile) + ") gt policy value: " + str(policy_value))
+
+                # Experiment 3: Try to assess the value of the behavior policy
+                target_policy_path = policy_metadatas[0]['policy_path']
+                behavior_policy_path = policy_metadatas[4]['policy_path']  # using different policy paths now.
+                (lower_quantile, upper_quantile), policy_value = calculate_policy_value(target_policy_path,
+                                                                                        behavior_policy_path, ope_model,
+                                                                                        5)
+                print("policy value: (" + str(lower_quantile) + "," + str(upper_quantile) + ") gt policy value: " + str(
+                    policy_value))
+                import ipdb;
+
+                ipdb.set_trace()
 
 
 
