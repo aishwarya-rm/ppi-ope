@@ -1,14 +1,10 @@
 from __future__ import division
 import tensorflow as tf
 import numpy as np
-from collections import deque
-import random
 import tensorflow_probability as tfp
-from utils import *
 from tensorflow.nn.rnn_cell import LSTMStateTuple
 import pickle
 import os
-from scipy.stats import norm
 
 slim = tf.contrib.slim
 rnn = tf.contrib.rnn
@@ -656,27 +652,12 @@ class D4RL_Policy:
         self.fclast_b = weights['last_fc/bias']
         self.fclast_w_logstd = weights['last_fc_log_std/weight']
         self.fclast_b_logstd = weights['last_fc_log_std/bias']
-        self.nonlinearity = self.get_nonlinearity(weights['nonlinearity'])
-        self.output_transformation = self.get_output_transformation(weights['output_distribution'])
+        relu = lambda x: np.maximum(x, 0)
+        self.nonlinearity = np.tanh if weights['nonlinearity'] == 'tanh' else relu
 
-    def get_nonlinearity(self, nonlinearity_type):
-        if nonlinearity_type == 'tanh':
-            return np.tanh
-        else:
-            return self.relu
+        identity = lambda x: x
+        self.output_transformation = np.tanh if weights['output_distribution'] == 'tanh_gaussian' else identity
 
-    @staticmethod
-    def relu(x):
-        return np.maximum(x, 0)
-
-    def get_output_transformation(self, output_distribution):
-        if output_distribution == 'tanh_gaussian':
-            return np.tanh
-        else:
-            return self.identity
-    @staticmethod
-    def identity(x):
-        return x
     def act(self, state, noise=0.):
         x = np.dot(self.fc0_w, state) + self.fc0_b
         x = self.nonlinearity(x)
@@ -685,14 +666,5 @@ class D4RL_Policy:
         mean = np.dot(self.fclast_w, x) + self.fclast_b
         logstd = np.dot(self.fclast_w_logstd, x) + self.fclast_b_logstd
 
-        std = np.exp(logstd)
         action = self.output_transformation(mean + np.exp(logstd) * noise)
-        return action, mean, std
-    def propensity_score(self, state, action):
-        _, mean, std = self.act(state)
-        prob_density = norm.pdf(action, loc=mean, scale=std)
-        return np.prod(prob_density)  # Multiply over dimensions for multi-dimensional actions
-
-
-
-
+        return action, mean

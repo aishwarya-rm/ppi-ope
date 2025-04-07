@@ -7,24 +7,19 @@ import gym
 from gym import wrappers
 import cloudpickle as cp
 from VLBM import *
-import os
 import tensorflow_probability as tfp
 import multiprocessing as mp
 import os
 import d4rl
 import json
-from functools import partial
 import pandas as pd
 import argparse
 import pickle
 import tqdm
 import dill
 import collections
-import concurrent.futures
-from multiprocessing import Manager
-from utils import generate_and_check_trajectory, LearnedEnv
+# from utils import generate_and_check_trajectory
 
-mp.set_start_method("spawn")
 slim = tf.contrib.slim
 rnn = tf.contrib.rnn
 tfd = tfp.distributions
@@ -152,8 +147,28 @@ def evaluate(ope_eval, graph_ope_eval, sess_ope_eval, *args):
                     
         pred += [np.mean(ep_rewards)]
     return np.mean(np.abs(np.asarray(truths)-np.asarray(pred)))
+def generate_trajectory(policy_path, env_string, ope_model):
+    policy = D4RL_Policy(policy_path)
+    class LearnedEnv(object):
+        def __init__(self, model):
+            self.model = model
 
-def generate_trajectory(policy, env):
+        def reset(self):
+            s0 = self.model.init_z0_s0()
+
+            self.obs = s0
+            return s0
+
+        def step(self, u):
+            new_obs, reward = self.model.get_zt1_s2_r(np.reshape(u, (1, env_action_dim)))
+            self.obs = new_obs
+            self.model.update_zt()
+
+            return new_obs, reward, False, {}
+    if env_string == 'learned':
+        env = LearnedEnv(ope_model)
+    else:
+        env = gym.make('halfcheetah-medium-expert-v2')
     s = env.reset()
     s = s.reshape(env_state_dim) * obs_std + obs_mean
     ep_reward = 0
@@ -175,6 +190,7 @@ def generate_trajectory(policy, env):
 
         if terminal or j == MAX_EPISODE_LEN - 1:
             return ep_reward, trajectory, trajectory_actions
+
 def calculate_ips_product(t_t, t_a, target_policy, behavior_policy):
     ips_vals = []
     for i in range(len(t_a)):
@@ -185,7 +201,6 @@ def calculate_ips_product(t_t, t_a, target_policy, behavior_policy):
         else:
             ips_vals.append(ips_weight)
     return np.sum(ips_vals)
-
 def calculate_policy_value(target_policy_path, behavior_policy_path, ope_model, n_tries=100):
     # Returns a list of trajectories that are calibrated for this particular behavior and target policy
     ope_path = args.path
@@ -263,10 +278,8 @@ def calculate_policy_value(target_policy_path, behavior_policy_path, ope_model, 
     parallelize = True
     if parallelize:
         pool = mp.Pool(processes=4)
-        # Bundle policies and environments to pass to worker functions
-        policies_and_envs = (target_policy, learned_env, behavior_policy, original_env)
         mp.reduction.ForkingPickler = dill.Pickler
-        results = pool.map(cp.loads(cp.dumps(generate_and_check_trajectory)), [(policies_and_envs) for i in range(max_attempts)])
+        results = pool.map(cp.loads(cp.dumps(generate_and_check_trajectory)), [(ope_model, target_policy_path, behavior_policy_path) for i in range(max_attempts)])
         pool.close()
         pool.join()
         pool.join()

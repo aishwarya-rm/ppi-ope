@@ -20,11 +20,14 @@ from train_vlbm import generate_trajectory
 import random
 import numpy as np
 import gym
-def generate_and_check_trajectory(policies_and_envs, epsilon):
+import pickle
+from VLBM import D4RL_Policy
+
+def generate_and_check_trajectory(ope_model, target_policy_path, behavior_policy_path, epsilon=0.2):
     """Generate trajectories and check the conditions in parallel."""
-    target_policy, learned_env, behavior_policy, original_env = policies_and_envs
     env = gym.make('halfcheetah-medium-expert-v2')
-    env_action_dim = env.action_space.shape[0]
+    target_policy = D4RL_Policy(target_policy_path)
+    behavior_policy = D4RL_Policy(behavior_policy_path)
     class LearnedEnv(object):
         def __init__(self, model):
             self.model = model
@@ -41,6 +44,13 @@ def generate_and_check_trajectory(policies_and_envs, epsilon):
             self.model.update_zt()
             return new_obs, reward, False, {}
 
+    env_action_dim = env.action_space.shape[0]
+    learned_env = LearnedEnv(ope_model)
+    ENV = 'halfcheetah-medium-expert-v2'
+    rl_params = {
+        'env_name': ENV,
+    }
+    original_env = gym.make(rl_params['env_name'])
 
     b_r, b_t, b_a = generate_trajectory(behavior_policy, original_env)
     t_r, t_t, t_a = generate_trajectory(target_policy, learned_env)
@@ -52,6 +62,7 @@ def generate_and_check_trajectory(policies_and_envs, epsilon):
             pickle.dump(obj, open("calibration_dataset/" + str(rand_int) + ".pkl", 'wb'))
             return (t_r, t_t, t_a), (b_r, b_t, b_a)
     return (0, [], []), (0, [], [])
+
 def my_static_rnn(cell,
                inputs,
                initial_state=None,
