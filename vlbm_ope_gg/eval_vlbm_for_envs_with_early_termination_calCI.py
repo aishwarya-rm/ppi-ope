@@ -1,10 +1,7 @@
 import tensorflow as tf
 import numpy as np
-from collections import deque
-import random
 import gym
 import tqdm
-from gym import wrappers
 # from VLBM_for_envs_with_early_termination import *
 from VLBM import *
 import os
@@ -13,9 +10,8 @@ import multiprocessing as mp
 import os
 import d4rl
 import json
-import pandas as pd
 import argparse
-import collections
+from scipy.stats import spearmanr
 from utils import generate_and_check_trajectory
 
 slim = tf.contrib.slim
@@ -35,9 +31,7 @@ parser.add_argument("-path", type=str, help="Path to checkpoint folder")
 parser.add_argument("-repeat", type=int, help="Set action repeat. Since we are training on offline trajectories, so this is not needed (always set to 1)", default=1)
 parser.add_argument("-max_episode_len", type=int, help="Maximum episode length, which is always 1000 for Gym-Mujoco environments", default=100)
 
-def evaluate(target_policy_path):
-    # Function to estimate policy returns of VLBM, using MCMC
-
+def evaluate(target_policy_path): # This just generates a trajectory using the given path and the learned OPE model. 
     file_appendix = ""
 
     env = gym.make(rl_params['env_name'])
@@ -67,11 +61,8 @@ def evaluate(target_policy_path):
                 is_training=False
             )
 
-
             ope_saver = ope_model.saver
-
             ope_saver.restore(sess_ope_models, os.path.join(ope_path, "ope_best.ckpt"))
-
 
             d4rl_qlearning = d4rl.qlearning_dataset(env)
             
@@ -163,10 +154,10 @@ def evaluate(target_policy_path):
 
                     return ep_reward, trajectory, trajectory_actions
 
-
 def calculate_ips_product(t_t, t_a, target_policy, behavior_policy):
     ips_vals = []
-    for i in range(len(t_a)):
+    # T_t is the states
+    for i in range(len(t_a)): # All of the actions in the trajectory
         # add exp
         ips_weight = np.log(target_policy.propensity_score(t_t[i], t_a[i])) - np.log(
             behavior_policy.propensity_score(t_t[i], t_a[i]))
@@ -175,143 +166,6 @@ def calculate_ips_product(t_t, t_a, target_policy, behavior_policy):
         else:
             ips_vals.append(ips_weight)
     return np.exp(np.sum(ips_vals)) # add exp
-
-def calculate_policy_value(target_policy_path, behavior_policy_path, ope_model, n_tries=100):
-    # Returns a list of trajectories that are calibrated for this particular behavior and target policy
-    ope_path = args.path
-    ope_saver = ope_model.saver
-    with tf.Session(config=config, graph=graph_ope_models) as sess_ope_model:
-        ope_saver.restore(sess_ope_model, os.path.join(ope_path, "ope_best.ckpt"))
-
-    d4rl_qlearning = d4rl.qlearning_dataset(env)
-
-    class LearnedEnv(object):
-        def __init__(self, model):
-            self.model = model
-
-        def reset(self):
-            s0 = self.model.init_z0_s0()
-
-            self.obs = s0
-            return s0
-
-        def step(self, u):
-            new_obs, reward = self.model.get_zt1_s2_r(np.reshape(u, (1, env_action_dim)))
-            self.obs = new_obs
-            self.model.update_zt()
-
-            return new_obs, reward, False, {}
-
-    learned_env = LearnedEnv(ope_model)
-    ENV = args.env
-    rl_params = {
-        'env_name': ENV,
-    }
-    original_env = gym.make(rl_params['env_name'])
-
-    np.random.seed(RANDOM_SEED)
-    tf.set_random_seed(RANDOM_SEED)
-
-    target_policy = D4RL_Policy(target_policy_path)
-    behavior_policy = D4RL_Policy(behavior_policy_path)
-
-    # Calculate the true value of the policy
-    true_target_rewards = []
-    for _, i in enumerate(tqdm.tqdm(range(n_tries))):
-        target_reward, _, _ = generate_trajectory(target_policy, original_env)
-        true_target_rewards.append(target_reward)
-
-    # Generate a set of trajectories for the first term from target policy
-    first_term_target_rewards = []
-    for _, i in enumerate(tqdm.tqdm(range(n_tries))):  # TODO: Make this 100000
-        ep_reward, _, _ = generate_trajectory(target_policy, learned_env)
-        first_term_target_rewards.append(ep_reward)
-
-    # Generate possible matching trajectories (this is without paralellization)
-    # epsilon = 0.2
-    # predicted_returns = []
-    # actual_returns = []
-    # # Or alternatively generate trajectories until you reach a total calibration dataset size
-    # calibration_dataset_size = 100
-    # attempts = 0
-    # while len(predicted_returns) < calibration_dataset_size:
-    #     b_r, b_t = generate_trajectory(behavior_policy, original_env)
-    #     t_r, t_t = generate_trajectory(target_policy, learned_env)
-    #     attempts += 1
-    #     if (np.linalg.norm(t_t[0][:8] - b_t[0][:8]) < epsilon):
-    #         if (np.linalg.norm(t_t[-1][:8] - b_t[-1][:8]) < epsilon):  # First and last state are the same
-    #             predicted_returns.append(t_r)
-    #             actual_returns.append(b_r)
-    #     if attempts >= 4000:
-    #         break
-
-    # Parallelize the calibration dataset generation:
-    epsilon = 0.2
-    calibration_dataset_size = 100
-    max_attempts = 4000
-
-    parallelize = True
-    if parallelize:
-        pool = mp.Pool(processes=4)
-        # Bundle policies and environments to pass to worker functions
-        policies_and_envs = (target_policy, learned_env, behavior_policy, original_env)
-        mp.reduction.ForkingPickler = dill.Pickler
-        results = pool.map(cp.loads(cp.dumps(generate_and_check_trajectory)), [(policies_and_envs) for i in range(max_attempts)])
-        pool.close()
-        pool.join()
-        pool.join()
-
-
-        # Process valid results
-        # # TODO: go through every saved trajectory?
-        # (t_r, t_t, t_a), (b_r, b_t, b_a) = result
-        # if len(t_t) > 0:
-        #     predicted_returns.append(t_r)
-        #     actual_returns.append(b_r)
-        #     ips_weight = calculate_ips_product(t_t, t_a, target_policy, behavior_policy)
-        #     predicted_ips_weights.append(ips_weight)
-        import ipdb; ipdb.set_trace()
-    else:
-        print("no parallelization")
-        pass
-        # predicted_returns = []
-        # actual_returns = []
-        # predicted_ips_weights = []
-        # for i in range(max_attempts):
-        #     result = generate_and_check_trajectory(i)
-        #     if result is not None:
-        #         (t_r, t_t, t_a), (b_r, b_t, b_a) = result
-        #         predicted_returns.append(t_r)
-        #         actual_returns.append(b_r)
-        #         predicted_ips_weights.append(calculate_ips_product(t_t, t_a))
-        #     if len(predicted_returns) >= calibration_dataset_size:
-        #         break
-
-    print("Size of calibration dataset: " + str(len(predicted_returns))) # If this is around 50, we are maximally matching.
-
-    # Option 2: nearest neighbor?
-    IPS_weighting = True
-
-    if len(predicted_returns) == 0:
-        print("Cannot calculate quantiles")
-        return (0, 0), np.mean(true_target_rewards)
-    # Calculate quantiles over the calibration dataset rather than mean/sd
-    alpha = 0.1 # 90% coverage
-    # predicted_returns is t_rs
-    if IPS_weighting:
-        ips_weighted_errors = []
-        for i in range(len(predicted_returns)):
-            # weights were loged
-            ips_weighted_errors.append(predicted_ips_weights[i] * (actual_returns[i] - predicted_returns[i]))
-        import ipdb; ipdb.set_trace()
-        return (np.mean(first_term_target_rewards) - np.quantile(ips_weighted_errors, 1 - alpha), (np.mean(first_term_target_rewards) - np.quantile(ips_weighted_errors, alpha))), np.mean(true_target_rewards)
-    else:
-        errors = []
-        for i in range(len(predicted_returns)):
-            errors.append(actual_returns[i] - predicted_returns[i])
-        return (np.mean(first_term_target_rewards) - np.quantile(errors, 1 - alpha), (np.mean(first_term_target_rewards) - np.quantile(errors, alpha))), np.mean(true_target_rewards)
-
-
 
 if __name__ == '__main__':
     args = parser.parse_args()
@@ -330,9 +184,10 @@ if __name__ == '__main__':
     REPEAT = args.repeat # Action repeat is not needed since we are training on offline trajectories. So it's always set to 1.
     CODE_SIZE = args.code_size
     MAX_EPISODES = args.max_episodes
-    epsilon = 0.2
-    n_tries=100
-    alpha = 0.1 # 90% coverage
+    epsilon = 0.25
+    n_tries = 100
+    n_tries_parallel = 70
+    alpha = 0.05 # 95% coverage
 
     ENV = args.env
 
@@ -370,88 +225,81 @@ if __name__ == '__main__':
     preds = []
     truths = []
 
-    for i in [1]: # test
+    for i in [10]: # test (Generate trajectories from policy 1)
         print("target policy start generation")
 
-        target_policy_path = policy_metadatas[i]['policy_path']
-        target_policy = D4RL_Policy(target_policy_path)
+        policy_path = policy_metadatas[i]['policy_path']
+        target_policy = D4RL_Policy(policy_path)
         
         print("********{}********".format(policy_metadatas[i]['policy_path']))
 
-        truths += [np.loadtxt("./truth_discounted/" + target_policy_path + ".txt")[0]]
+        truths += [np.loadtxt("./truth_discounted/" + policy_path + ".txt")[0]]
 
 
         pool = mp.Pool(30)
-        # ep_rewards = pool.map(evaluate, [target_policy_path for _ in range(50)])
-        res = pool.map(evaluate, [target_policy_path for _ in range(60)])
-        # res = [evaluate(target_policy_path) for _ in range(500)]
+        res = pool.map(evaluate, [policy_path for _ in range(n_tries_parallel)])
         t_rs, t_ts, t_as = zip(*res)
         pool.close()
         pool.join()
 
-        # preds += [np.mean(ep_rewards)]
-
-    for i in [0]: # test
+    for i in [9]: # test # Generate trajectories from policy 0
         print("behavior policy start generation")
 
-        target_policy_path = policy_metadatas[i]['policy_path']
-        behavior_policy = D4RL_Policy(target_policy_path)
+        policy_path = policy_metadatas[i]['policy_path']
+        behavior_policy = D4RL_Policy(policy_path)
         
         print("********{}********".format(policy_metadatas[i]['policy_path']))
 
-        truths += [np.loadtxt("./truth_discounted/" + target_policy_path + ".txt")[0]]
-
+        truths += [np.loadtxt("./truth_discounted/" + policy_path + ".txt")[0]]
 
         pool = mp.Pool(30)
-        # ep_rewards = pool.map(evaluate, [target_policy_path for _ in range(50)])
-        res = pool.map(evaluate, [target_policy_path for _ in range(60)])
-        # res = [evaluate(target_policy_path) for _ in range(500)]
+        res = pool.map(evaluate, [policy_path for _ in range(n_tries_parallel)])
         b_rs, b_ts, b_as = zip(*res)
         pool.close()
         pool.join()
 
-        # preds += [np.mean(ep_rewards)]
-
     results_t = []
     results_b = []
-    for i in range(60):
+    # Search among the trajectories that you have generated to create a calbiration dataset.
+    for i in range(n_tries_parallel):
         b_r, b_t, b_a = b_rs[i], b_ts[i], b_as[i]
         t_r, t_t, t_a = t_rs[i], t_ts[i], t_as[i]
-        if (np.linalg.norm(t_t[0][:8] - b_t[0][:8])/np.linalg.norm(b_t[0][:8]) < epsilon):
-            if (np.linalg.norm(t_t[-1][:8] - b_t[-1][:8])/np.linalg.norm(b_t[-1][:8]) < epsilon):
+        if (np.linalg.norm(t_t[0][:8] - b_t[0][:8]) < epsilon):
+            if (np.linalg.norm(t_t[-1][:8] - b_t[-1][:8]) < epsilon):
                 obj = {'tr':t_r, 't_t':t_t, 't_a':t_a, 'b_r':b_r, 'b_t':b_t, 'b_a':b_a}
-                # rand_int = np.random.choice(10000)
                 if not os.path.exists("./calibration_dataset/"):
                     os.mkdir("./calibration_dataset/")
                 pickle.dump(obj, open("./calibration_dataset/" + str(i) + ".pkl", 'wb'))
                 results_t += [(t_r, t_t, t_a)]
                 results_b += [(b_r, b_t, b_a)]
-        # return (0, [], []), (0, [], [])
-    
+
     assert len(results_t) > 0, "results_t length is zero!"
     assert len(results_b) > 0, "results_b length is zero!"
-    print("len of found matached trajectories: ", len(results_t))
+    print("len of found matched trajectories: ", len(results_t))
 
     filtered_t_rs, filtered_t_ts, filtered_t_as = zip(*results_t)
     filtered_b_rs, filtered_b_ts, filtered_b_as = zip(*results_b)
 
-    predicted_returns = filtered_t_rs
-    actual_returns = filtered_b_rs
+    target_returns = filtered_t_rs
+    behavior_returns = filtered_b_rs
     predicted_ips_weights = []
-    for i in range (60):
-        t_t = t_ts[i]
-        t_a = t_as[i]
-        predicted_ips_weights += [calculate_ips_product(t_t, t_a, target_policy, behavior_policy)]
+    for i in range (len(behavior_returns)): # Should only be on the calibration dataset.
+        b_t = filtered_b_ts[i]
+        b_a = filtered_b_as[i]
+        predicted_ips_weights += [calculate_ips_product(b_t, b_a, target_policy, behavior_policy)] # Calculates the weights for all terms in the behavior trajectory
     
-    first_term_target_rewards = t_rs
+    first_term_target_rewards = t_rs # Calculating the first term
     ips_weighted_errors = []
-    for i in range(len(predicted_returns)):
+    regular_errors = []
+    for i in range(len(target_returns)):
         # should norm or absolute: actual_returns[i] - predicted_returns[i]
-        ips_weighted_errors.append(predicted_ips_weights[i] * (actual_returns[i] - predicted_returns[i]))
+        ips_weighted_errors.append(np.abs(predicted_ips_weights[i] * behavior_returns[i] - target_returns[i])) # This should be the absolute value of the difference between returns
+        regular_errors.append(np.abs(behavior_returns[i] - target_returns[i]))
     print("predicted_ips_weights ", predicted_ips_weights)
     print("ips_weighted_errors ", ips_weighted_errors)
-    print("actual_returns ", actual_returns)
-    print("predicted_returns ", predicted_returns)
+    print("target_returns ", target_returns)
+    print("behavior_returns ", behavior_returns)
+    print("unweighted_errors ", regular_errors)
 
 
     true_target_rewards = []
@@ -462,22 +310,26 @@ if __name__ == '__main__':
     rew_mean = d4rl_qlearning['rewards'].mean()
     rew_std = d4rl_qlearning['rewards'].std()
 
-    for _, i in enumerate(tqdm.tqdm(range(n_tries))):
+    for _, i in enumerate(tqdm.tqdm(range(n_tries))): # Calculating the actual value using monte carlo sampling
         target_reward, _, _ = generate_trajectory(target_policy, env, obs_std, obs_mean, MAX_EPISODE_LEN, env_state_dim, env_action_dim, rew_std, rew_mean)
         true_target_rewards.append(target_reward)    
 
     # import ipdb; ipdb.set_trace()
-    print(np.mean(first_term_target_rewards) - np.quantile(ips_weighted_errors, 1 - alpha), (np.mean(first_term_target_rewards) - np.quantile(ips_weighted_errors, alpha)), np.mean(true_target_rewards))
+    print("With IPS weighting")
+    print(np.mean(first_term_target_rewards), np.mean(first_term_target_rewards) - np.quantile(ips_weighted_errors, 1 - alpha), (np.mean(first_term_target_rewards) - np.quantile(ips_weighted_errors, alpha)), np.mean(true_target_rewards))
+
+    print("Without IPS weighting")
+    print(np.mean(first_term_target_rewards), np.mean(first_term_target_rewards) - np.quantile(regular_errors, 1 - alpha), (np.mean(first_term_target_rewards) - np.quantile(regular_errors, alpha)), np.mean(true_target_rewards))
 
 
-    preds = np.asarray(preds)
-    truths = np.asarray(truths)
-    print ("MAE:", np.mean(np.abs((preds - truths))))
-
-    rank, _ = spearmanr(preds, truths)
-    print ("Rank:", rank)
-
-    print("Regret:", (np.max(truths) - truths[np.argmax(preds)])/np.max(truths))
+    # preds = np.asarray(preds)
+    # truths = np.asarray(truths)
+    # print ("MAE:", np.mean(np.abs((preds - truths))))
+    #
+    # rank, _ = spearmanr(preds, truths)
+    # print ("Rank:", rank)
+    #
+    # print("Regret:", (np.max(truths) - truths[np.argmax(preds)])/np.max(truths))
     
 
 

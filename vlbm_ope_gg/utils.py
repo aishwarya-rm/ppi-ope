@@ -25,11 +25,15 @@ def generate_trajectory(policy, env, obs_std, obs_mean, MAX_EPISODE_LEN, env_sta
     s = env.reset()
     s = s.reshape(env_state_dim) * obs_std + obs_mean
     ep_reward = 0
+    epsilon = 0.1
     trajectory = [s]
     trajectory_actions = []
     terminal = 0
     for j in range(MAX_EPISODE_LEN):
         if j % REPEAT == 0:
+            # if np.random.rand() < epsilon:
+            #     a = env.action_space.sample()  # random action
+            # else:
             a, _, _ = policy.act(np.reshape(s, (env_state_dim,)), np.zeros((env_action_dim,)))
         trajectory_actions.append(a)
         s2, r, terminal, info = env.step(a)

@@ -670,7 +670,7 @@ class D4RL_Policy:
         return np.maximum(x, 0)
 
     def get_output_transformation(self, output_distribution):
-        print("output_distribution ", output_distribution)
+        # print("output_distribution ", output_distribution)
         if output_distribution == 'tanh_gaussian':
             return np.tanh
         else:
@@ -696,7 +696,8 @@ class D4RL_Policy:
         # apply one more tanh after norm
         prob_density = np.tanh(norm.pdf(action, loc=mean, scale=std))
         # prob_density = norm.pdf(action, loc=mean, scale=std) # need double check if it is correct
-        return np.prod(prob_density)  # Multiply over dimensions for multi-dimensional actions
+        return np.prod(prob_density)
+        # return np.max(np.prod(prob_density) + np.random.normal(loc=0, scale=0.2), 0)# Multiply over dimensions for multi-dimensional actions
 
 
 
