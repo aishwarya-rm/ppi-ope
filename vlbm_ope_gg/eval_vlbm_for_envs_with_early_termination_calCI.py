@@ -315,10 +315,10 @@ if __name__ == '__main__':
 
     # import ipdb; ipdb.set_trace()
     print("With IPS weighting")
-    print(np.mean(first_term_target_rewards), np.mean(first_term_target_rewards) - np.quantile(ips_weighted_errors, 1 - alpha), (np.mean(first_term_target_rewards) - np.quantile(ips_weighted_errors, alpha)), np.mean(true_target_rewards))
+    print(np.mean(first_term_target_rewards), np.mean(first_term_target_rewards) - np.quantile(ips_weighted_errors, 1 - alpha), (np.mean(first_term_target_rewards) + np.quantile(ips_weighted_errors, 1-alpha)), np.mean(true_target_rewards))
 
     print("Without IPS weighting")
-    print(np.mean(first_term_target_rewards), np.mean(first_term_target_rewards) - np.quantile(regular_errors, 1 - alpha), (np.mean(first_term_target_rewards) - np.quantile(regular_errors, alpha)), np.mean(true_target_rewards))
+    print(np.mean(first_term_target_rewards), np.mean(first_term_target_rewards) - np.quantile(regular_errors, 1 - alpha), (np.mean(first_term_target_rewards) + np.quantile(regular_errors, 1-alpha)), np.mean(true_target_rewards))
 
 
     # preds = np.asarray(preds)
