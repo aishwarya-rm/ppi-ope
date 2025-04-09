@@ -184,7 +184,7 @@ if __name__ == '__main__':
     REPEAT = args.repeat # Action repeat is not needed since we are training on offline trajectories. So it's always set to 1.
     CODE_SIZE = args.code_size
     MAX_EPISODES = args.max_episodes
-    epsilon = 0.25
+    epsilon = 0.3
     n_tries = 100
     n_tries_parallel = 70
     alpha = 0.05 # 95% coverage
@@ -225,8 +225,8 @@ if __name__ == '__main__':
     preds = []
     truths = []
 
-    for i in [10]: # test (Generate trajectories from policy 1)
-        print("target policy start generation")
+    for i in [8]: # test (Generate trajectories from policy 1)
+        print("target policy start generation, policy=" + str(i))
 
         policy_path = policy_metadatas[i]['policy_path']
         target_policy = D4RL_Policy(policy_path)
@@ -235,15 +235,14 @@ if __name__ == '__main__':
 
         truths += [np.loadtxt("./truth_discounted/" + policy_path + ".txt")[0]]
 
-
         pool = mp.Pool(30)
         res = pool.map(evaluate, [policy_path for _ in range(n_tries_parallel)])
         t_rs, t_ts, t_as = zip(*res)
         pool.close()
         pool.join()
 
-    for i in [9]: # test # Generate trajectories from policy 0
-        print("behavior policy start generation")
+    for i in [7]: # test # Generate trajectories from policy 0
+        print("behavior policy start generation, policy=" + str(i))
 
         policy_path = policy_metadatas[i]['policy_path']
         behavior_policy = D4RL_Policy(policy_path)

@@ -30,11 +30,11 @@ def generate_trajectory(policy, env, obs_std, obs_mean, MAX_EPISODE_LEN, env_sta
     trajectory_actions = []
     terminal = 0
     for j in range(MAX_EPISODE_LEN):
-        if j % REPEAT == 0:
-            # if np.random.rand() < epsilon:
-            #     a = env.action_space.sample()  # random action
-            # else:
-            a, _, _ = policy.act(np.reshape(s, (env_state_dim,)), np.zeros((env_action_dim,)))
+        if j % REPEAT == 0: # Adding some randomness to the trajectory (this should be okay since we're not really using IPS weighting)
+            if np.random.rand() < epsilon:
+                a = env.action_space.sample()  # random action
+            else:
+                a, _, _ = policy.act(np.reshape(s, (env_state_dim,)), np.zeros((env_action_dim,)))
         trajectory_actions.append(a)
         s2, r, terminal, info = env.step(a)
         r = r * rew_std + rew_mean
