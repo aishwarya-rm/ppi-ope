@@ -31,7 +31,7 @@ parser.add_argument("-path", type=str, help="Path to checkpoint folder")
 parser.add_argument("-repeat", type=int, help="Set action repeat. Since we are training on offline trajectories, so this is not needed (always set to 1)", default=1)
 parser.add_argument("-max_episode_len", type=int, help="Maximum episode length, which is always 1000 for Gym-Mujoco environments", default=100)
 
-def evaluate(target_policy_path): # This just generates a trajectory using the given path and the learned OPE model. 
+def evaluate(policy_path): # This just generates a trajectory using the given path and the learned OPE model.
     file_appendix = ""
 
     env = gym.make(rl_params['env_name'])
@@ -79,25 +79,6 @@ def evaluate(target_policy_path): # This just generates a trajectory using the g
             rew_mean = d4rl_qlearning['rewards'].mean()
             rew_std = d4rl_qlearning['rewards'].std()
 
-            # class LearnedEnv(object):
-            #     def __init__(self, model):
-
-            #         self.model = model
-
-            #     def reset(self):
-            #         self.model.init_z0_s0()
-            #         s0 = self.model.sess.run(self.model.decoder_state_sample, 
-            #                            feed_dict={self.model.decoder_zt_holder:self.model.zt}).reshape(-1)
-
-            #         self.obs = s0
-            #         return s0
-
-            #     def step(self, u):
-            #         new_obs, reward, terminal = self.model.get_zt1_s2_r(np.reshape(u, (1, env_action_dim)))
-            #         self.obs = new_obs
-            #         self.model.update_zt()
-
-            #         return new_obs, reward, terminal, {}
 
             class LearnedEnv(object):
                 def __init__(self, model):
@@ -122,7 +103,7 @@ def evaluate(target_policy_path): # This just generates a trajectory using the g
             tf.set_random_seed(RANDOM_SEED)
 
             ep_rewards = []
-            policy = D4RL_Policy(target_policy_path)
+            policy = D4RL_Policy(policy_path)
 
             terminal = 0
 
@@ -188,6 +169,8 @@ if __name__ == '__main__':
     n_tries = 100
     n_tries_parallel = 70
     alpha = 0.05 # 95% coverage
+    pi_e = 10
+    pi_b = 9
 
     ENV = args.env
 
@@ -224,13 +207,12 @@ if __name__ == '__main__':
 
     preds = []
     truths = []
-
-    for i in [8]: # test (Generate trajectories from policy 1)
+    for i in [pi_e]:  # Generate Trajectories Using the Learned Environment For Target Policy
         print("target policy start generation, policy=" + str(i))
 
         policy_path = policy_metadatas[i]['policy_path']
         target_policy = D4RL_Policy(policy_path)
-        
+
         print("********{}********".format(policy_metadatas[i]['policy_path']))
 
         truths += [np.loadtxt("./truth_discounted/" + policy_path + ".txt")[0]]
@@ -241,7 +223,7 @@ if __name__ == '__main__':
         pool.close()
         pool.join()
 
-    for i in [7]: # test # Generate trajectories from policy 0
+    for i in [pi_b]: # Generate Trajectories Using the Learned Environment For Behavior Policy
         print("behavior policy start generation, policy=" + str(i))
 
         policy_path = policy_metadatas[i]['policy_path']
@@ -253,51 +235,72 @@ if __name__ == '__main__':
 
         pool = mp.Pool(30)
         res = pool.map(evaluate, [policy_path for _ in range(n_tries_parallel)])
-        b_rs, b_ts, b_as = zip(*res)
+        b_gen_rs, b_gen_ts, b_gen_as = zip(*res)
         pool.close()
         pool.join()
 
-    results_t = []
-    results_b = []
+    # Generate Trajectories Using the Ground Truth Enviornment for the Behavior Policy
+    d4rl_qlearning = d4rl.qlearning_dataset(env)
+
+    obs_mean = d4rl_qlearning['observations'].mean(0).astype(np.float32)
+    obs_std = d4rl_qlearning['observations'].std(0).astype(np.float32)
+    rew_mean = d4rl_qlearning['rewards'].mean()
+    rew_std = d4rl_qlearning['rewards'].std()
+    b_o_rs = []
+    b_o_ts = []
+    b_o_as = []
+    for _, i in enumerate(tqdm.tqdm(range(n_tries_parallel))): # Calculating the actual value using monte carlo sampling
+        b_o_r, b_o_t, b_o_a = generate_trajectory(behavior_policy, env, obs_std, obs_mean, MAX_EPISODE_LEN, env_state_dim, env_action_dim, rew_std, rew_mean)
+        b_o_rs.append(b_o_r)
+        b_o_ts.append(b_o_t)
+        b_o_as.append(b_o_a)
+
+    results_b_o = []
+    results_b_gen = []
     # Search among the trajectories that you have generated to create a calbiration dataset.
     for i in range(n_tries_parallel):
-        b_r, b_t, b_a = b_rs[i], b_ts[i], b_as[i]
-        t_r, t_t, t_a = t_rs[i], t_ts[i], t_as[i]
-        if (np.linalg.norm(t_t[0][:8] - b_t[0][:8]) < epsilon):
-            if (np.linalg.norm(t_t[-1][:8] - b_t[-1][:8]) < epsilon):
-                obj = {'tr':t_r, 't_t':t_t, 't_a':t_a, 'b_r':b_r, 'b_t':b_t, 'b_a':b_a}
+        b_o_r, b_o_t, b_o_a = b_o_rs[i], b_o_ts[i], b_o_as[i]
+        b_gen_r, b_gen_t, b_gen_a = b_gen_rs[i], b_gen_ts[i], b_gen_as[i]
+        if (np.linalg.norm(b_o_t[0][:8] - b_o_t[0][:8]) < epsilon):
+            if (np.linalg.norm(b_gen_t[-1][:8] - b_gen_t[-1][:8]) < epsilon):
+                obj = {'b_o_r':b_o_r, 'b_o_t':b_o_t, 'b_o_a':b_o_a, 'b_gen_r':b_gen_r, 'b_gen_t':b_gen_t, 'b_gen_a':b_gen_a}
                 if not os.path.exists("./calibration_dataset/"):
                     os.mkdir("./calibration_dataset/")
                 pickle.dump(obj, open("./calibration_dataset/" + str(i) + ".pkl", 'wb'))
-                results_t += [(t_r, t_t, t_a)]
-                results_b += [(b_r, b_t, b_a)]
+                results_b_o += [(b_o_r, b_o_t, b_o_a)]
+                results_b_gen += [(b_gen_r, b_gen_t, b_gen_a)]
 
-    assert len(results_t) > 0, "results_t length is zero!"
-    assert len(results_b) > 0, "results_b length is zero!"
-    print("len of found matched trajectories: ", len(results_t))
+    assert len(results_b_o) > 0, "results_b_o length is zero!"
+    assert len(results_b_gen) > 0, "results_b_gen length is zero!"
+    print("len of found matched trajectories: ", len(results_b_o))
 
-    filtered_t_rs, filtered_t_ts, filtered_t_as = zip(*results_t)
-    filtered_b_rs, filtered_b_ts, filtered_b_as = zip(*results_b)
+    filtered_b_o_rs, filtered_b_o_ts, filtered_b_o_as = zip(*results_b_o)
+    filtered_b_gen_rs, filtered_b_gen_ts, filtered_b_gen_as = zip(*results_b_gen)
 
-    target_returns = filtered_t_rs
-    behavior_returns = filtered_b_rs
+    b_o_returns = filtered_b_o_rs
+    b_gen_returns = filtered_b_gen_rs
     predicted_ips_weights = []
-    for i in range (len(behavior_returns)): # Should only be on the calibration dataset.
-        b_t = filtered_b_ts[i]
-        b_a = filtered_b_as[i]
-        predicted_ips_weights += [calculate_ips_product(b_t, b_a, target_policy, behavior_policy)] # Calculates the weights for all terms in the behavior trajectory
+    policy_path = policy_metadatas[pi_b]['policy_path']
+    behavior_policy = D4RL_Policy(policy_path)
+    policy_path = policy_metadatas[pi_e]['policy_path']
+    target_policy = D4RL_Policy(policy_path)
+    for i in range (len(b_gen_returns)): # Should only be on the calibration dataset.
+        b_o = filtered_b_o_ts[i]
+        b_gen = filtered_b_gen_as[i]
+        # TODO: make this some w
+        predicted_ips_weights += [calculate_ips_product(b_o, b_gen, target_policy, behavior_policy)] # Calculates the weights for all terms in the behavior trajectory
     
     first_term_target_rewards = t_rs # Calculating the first term
     ips_weighted_errors = []
     regular_errors = []
-    for i in range(len(target_returns)):
+    for i in range(len(b_o_returns)):
         # should norm or absolute: actual_returns[i] - predicted_returns[i]
-        ips_weighted_errors.append(np.abs(predicted_ips_weights[i] * behavior_returns[i] - target_returns[i])) # This should be the absolute value of the difference between returns
-        regular_errors.append(np.abs(behavior_returns[i] - target_returns[i]))
+        ips_weighted_errors.append(np.abs(predicted_ips_weights[i] * b_o_returns[i] - b_gen_returns[i])) # This should be the absolute value of the difference between returns
+        regular_errors.append(np.abs(b_o_returns[i] - b_gen_returns[i]))
     print("predicted_ips_weights ", predicted_ips_weights)
     print("ips_weighted_errors ", ips_weighted_errors)
-    print("target_returns ", target_returns)
-    print("behavior_returns ", behavior_returns)
+    print("b_o_returns ", b_o_returns)
+    print("b_gen_returns ", b_gen_returns)
     print("unweighted_errors ", regular_errors)
 
 
@@ -315,6 +318,7 @@ if __name__ == '__main__':
 
     # import ipdb; ipdb.set_trace()
     print("With IPS weighting")
+    # TODO: double check that this is not symmetric?
     print(np.mean(first_term_target_rewards), np.mean(first_term_target_rewards) - np.quantile(ips_weighted_errors, 1 - alpha), (np.mean(first_term_target_rewards) + np.quantile(ips_weighted_errors, 1-alpha)), np.mean(true_target_rewards))
 
     print("Without IPS weighting")
