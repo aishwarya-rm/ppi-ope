@@ -20,8 +20,21 @@ from tensorflow.python.util import nest
 import random
 import numpy as np
 import gym
+import d4rl
 
-def generate_trajectory(policy, env, obs_std, obs_mean, MAX_EPISODE_LEN, env_state_dim, env_action_dim, rew_std, rew_mean, GAMMA=0.995, REPEAT=1):
+def generate_trajectory(policy, MAX_EPISODE_LEN=3, GAMMA=0.995, REPEAT=1): # From original environment
+
+    env = gym.make("halfcheetah-medium-expert-v2")
+
+    env_state_dim = env.observation_space.shape[0]
+    env_action_dim = env.action_space.shape[0]
+    d4rl_qlearning = d4rl.qlearning_dataset(env)
+
+    obs_mean = d4rl_qlearning['observations'].mean(0).astype(np.float32)
+    obs_std = d4rl_qlearning['observations'].std(0).astype(np.float32)
+    rew_mean = d4rl_qlearning['rewards'].mean()
+    rew_std = d4rl_qlearning['rewards'].std()
+
     s = env.reset()
     s = s.reshape(env_state_dim) * obs_std + obs_mean
     ep_reward = 0
