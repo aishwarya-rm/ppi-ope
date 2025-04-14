@@ -44,10 +44,10 @@ def generate_trajectory(policy, MAX_EPISODE_LEN=3, GAMMA=0.995, REPEAT=1): # Fro
     terminal = 0
     for j in range(MAX_EPISODE_LEN):
         if j % REPEAT == 0: # Adding some randomness to the trajectory (this should be okay since we're not really using IPS weighting)
-            if np.random.rand() < epsilon:
-                a = env.action_space.sample()  # random action
-            else:
-                a, _, _ = policy.act(np.reshape(s, (env_state_dim,)), np.zeros((env_action_dim,)))
+            # if np.random.rand() < epsilon:
+            #     a = env.action_space.sample()  # random action
+            # else:
+            a, _, _ = policy.act(np.reshape(s, (env_state_dim,)), np.zeros((env_action_dim,))) # Avoiding randomness
         trajectory_actions.append(a)
         s2, r, terminal, info = env.step(a)
         r = r * rew_std + rew_mean

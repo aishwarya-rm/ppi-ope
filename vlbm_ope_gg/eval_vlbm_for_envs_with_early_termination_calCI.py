@@ -14,7 +14,9 @@ import argparse
 from scipy.stats import spearmanr
 from utils import generate_and_check_trajectory
 
-# TODO: parallelize the trajectory generation with the original environment
+# TODO: may need to take out randomness in trajectory generation if IPS weights get too big.
+# TODO: need to hyperparameter tune epsilon_r, alpha_r
+# TODO: save the generated trajectories
 slim = tf.contrib.slim
 rnn = tf.contrib.rnn
 tfd = tfp.distributions
@@ -146,10 +148,11 @@ def calculate_ips_product(t_t, t_a, target_policy, behavior_policy):
         if np.isinf(ips_weight):  # when divide by zero happens
             continue
         else:
-            ips_vals.append(ips_weight)
+            # ips_vals.append(ips_weight)
+            ips_vals.append(min(10, max(1e-8, ips_weight))) # Clamping the IPS weights
     return np.exp(np.sum(ips_vals)) # add exp
 
-def find_similar_trajectories(data_dict, new_traj, new_reward, epsilon=3e-1, epsilon_reward=3e-1):
+def find_similar_trajectories(data_dict, new_traj, new_reward, epsilon=0.8, epsilon_reward=1.5):
     """
     data_dict: dict with keys 'returns', 'trajectories', 'actions'
         - 'returns': list of floats
@@ -170,10 +173,10 @@ def find_similar_trajectories(data_dict, new_traj, new_reward, epsilon=3e-1, eps
     for r, traj, a in zip(data_dict['returns'], data_dict['trajectories'], data_dict['actions']):
         # Compare first and last state (first 8 dims)
         first_close = np.linalg.norm(traj[0][:8] - new_traj[0][:8]) < epsilon
-        last_close = np.linalg.norm(traj[-1][:8] - new_traj[-1][:8]) < epsilon
+        # last_close = np.linalg.norm(traj[-1][:8] - new_traj[-1][:8]) < epsilon
         reward_close = abs(r - new_reward) < epsilon_reward
 
-        if first_close and last_close and reward_close:
+        if first_close and reward_close: # last_close
             matched_returns.append(r)
             matched_trajectories.append(traj)
             matched_actions.append(a)
@@ -203,7 +206,8 @@ if __name__ == '__main__':
     alpha = 0.05 # 95% coverage
     pi_e = 10
     pi_b = 9
-    alpha_r = 1
+    generate_traj = True
+    alpha_r = 6
 
     ENV = args.env
     ope_path = args.path
@@ -236,50 +240,68 @@ if __name__ == '__main__':
     preds = []
     truths = []
     # Generate Trajectories Using the Learned Environment For Target Policy (first term)
-    for i in [pi_e]:
-        print("target policy start generation, policy=" + str(i))
+    if generate_traj:
+        for i in [pi_e]:
+            print("target policy start generation, policy=" + str(i))
 
-        policy_path = policy_metadatas[i]['policy_path']
-        target_policy = D4RL_Policy(policy_path)
-        print("********{}********".format(policy_metadatas[i]['policy_path']))
+            policy_path = policy_metadatas[i]['policy_path']
+            target_policy = D4RL_Policy(policy_path)
+            print("********{}********".format(policy_metadatas[i]['policy_path']))
 
-        truths += [np.loadtxt("./truth_discounted/" + policy_path + ".txt")[0]]
+            truths += [np.loadtxt("./truth_discounted/" + policy_path + ".txt")[0]]
 
-        pool = mp.Pool(30)
-        res = pool.map(evaluate, [policy_path for _ in range(n_tries_parallel)])
-        t_rs, t_ts, t_as = zip(*res)
-        pool.close()
-        pool.join()
+            pool = mp.Pool(30)
+            res = pool.map(evaluate, [policy_path for _ in range(n_tries_parallel)])
+            t_rs, t_ts, t_as = zip(*res)
+            first_term_trajs = {'returns': t_rs, 'trajectories': t_ts, 'actions': t_as}
+            pickle.dump(first_term_trajs, open('./saved_trajectories/' + str(pi_e) + "_first_term.pkl", 'wb'))
+            pool.close()
+            pool.join()
+
+    first_term_trajs = pickle.load(open('./saved_trajectories/' + str(pi_e) + "_first_term.pkl", 'rb'))
+    t_rs = first_term_trajs['returns']
+    t_ts = first_term_trajs['trajectories']
+    t_as = first_term_trajs['actions']
     first_term_target_rewards = t_rs  # Calculating the first term
 
     # Generate Trajectories Using the Learned Environment For Behavior Policy
-    for i in [pi_b]:
-        print("behavior policy start generation, policy=" + str(i))
-        policy_path = policy_metadatas[i]['policy_path']
-        behavior_policy = D4RL_Policy(policy_path)
-        print("********{}********".format(policy_metadatas[i]['policy_path']))
-        truths += [np.loadtxt("./truth_discounted/" + policy_path + ".txt")[0]]
-        pool = mp.Pool(30)
-        res = pool.map(evaluate, [policy_path for _ in range(n_tries_parallel)])
-        b_gen_rs, b_gen_ts, b_gen_as = zip(*res)
-        pool.close()
-        pool.join()
+    if generate_traj:
+        for i in [pi_b]:
+            print("behavior policy start generation, policy=" + str(i))
+            policy_path = policy_metadatas[i]['policy_path']
+            behavior_policy = D4RL_Policy(policy_path)
+            print("********{}********".format(policy_metadatas[i]['policy_path']))
+            truths += [np.loadtxt("./truth_discounted/" + policy_path + ".txt")[0]]
+            pool = mp.Pool(30)
+            res = pool.map(evaluate, [policy_path for _ in range(n_tries_parallel)])
+            b_gen_rs, b_gen_ts, b_gen_as = zip(*res)
+            pool.close()
+            pool.join()
+            behavior_trajectories_diff = {'returns':b_gen_rs, 'trajectories':b_gen_ts, 'actions':b_gen_as}
+            pickle.dump(behavior_trajectories_diff, open('./saved_trajectories/' + str(pi_b) + "_diff.pkl", 'wb'))
+    behavior_trajectories_diff = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_diff.pkl", 'rb'))
+    b_gen_rs = behavior_trajectories_diff['returns']
+    b_gen_ts = behavior_trajectories_diff['trajectories']
+    b_gen_as = behavior_trajectories_diff['actions']
+
 
     # Generate Trajectories Using the Ground Truth Environment for the Behavior Policy
-    pool = mp.Pool(30)
-    res = pool.map(generate_trajectory, [behavior_policy for _ in range(n_tries_parallel)])
-    b_o_rs, b_o_ts, b_o_as = zip(*res)
-    pool.close()
-    pool.join()
-
-    # for _, i in enumerate(tqdm.tqdm(range(n_tries_parallel))): # Calculating the actual value using monte carlo sampling
-    #     b_o_r, b_o_t, b_o_a = generate_trajectory(behavior_policy, env, obs_std, obs_mean, MAX_EPISODE_LEN, env_state_dim, env_action_dim, rew_std, rew_mean)
-    #     b_o_rs.append(b_o_r)
-    #     b_o_ts.append(b_o_t)
-    #     b_o_as.append(b_o_a)
+    if generate_traj:
+        pool = mp.Pool(30)
+        res = pool.map(generate_trajectory, [behavior_policy for _ in range(n_tries_parallel)])
+        b_o_rs, b_o_ts, b_o_as = zip(*res)
+        pool.close()
+        pool.join()
+        behavior_trajectories_o = {'returns': b_o_rs, 'trajectories': b_o_ts, 'actions': b_o_as}
+        pickle.dump(behavior_trajectories_o, open('./saved_trajectories/' + str(pi_b) + "_o.pkl", 'wb'))
+    behavior_trajectories_o = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_o.pkl", 'rb')) # This is always going to be similar?
+    b_o_rs = behavior_trajectories_o['returns']
+    b_o_ts = behavior_trajectories_o['trajectories']
+    b_o_as = behavior_trajectories_o['actions']
 
     results_b_o = []
     results_b_gen = []
+    print("Creating Calibration Dataset")
     # Search among the trajectories that you have generated to create a calbiration dataset.
     for i in range(n_tries_parallel):
         b_o_r, b_o_t, b_o_a = b_o_rs[i], b_o_ts[i], b_o_as[i]
@@ -302,15 +324,17 @@ if __name__ == '__main__':
 
     # Create a large set of trajectories from the original enviornment (TODO may need to change to the learned environment idk)
     print("Creating pi_b dataset to calculate weights")
-    pool = mp.Pool(30)
-    res = pool.map(generate_trajectory, [behavior_policy for _ in range(400)])
-    behavior_dataset_returns, behavior_dataset_trajectories, behavior_dataset_actions = zip(*res)
-    pool.close()
-    pool.join()
-    if not os.path.exists('./saved_trajectories'):
-        os.mkdir('./saved_trajectories')
-    behavior_trajectories_all = {'returns':behavior_dataset_returns, 'trajectories':behavior_dataset_trajectories, 'actions':behavior_dataset_actions}
-    pickle.dump(behavior_trajectories_all, open('./saved_trajectories/' + str(pi_b) + ".pkl", 'wb'))
+    if generate_traj:
+        pool = mp.Pool(30)
+        res = pool.map(generate_trajectory, [behavior_policy for _ in range(400)])
+        behavior_dataset_returns, behavior_dataset_trajectories, behavior_dataset_actions = zip(*res)
+        pool.close()
+        pool.join()
+        if not os.path.exists('./saved_trajectories'):
+            os.mkdir('./saved_trajectories')
+        behavior_trajectories_all = {'returns':behavior_dataset_returns, 'trajectories':behavior_dataset_trajectories, 'actions':behavior_dataset_actions}
+        pickle.dump(behavior_trajectories_all, open('./saved_trajectories/' + str(pi_b) + ".pkl", 'wb'))
+    behavior_trajectories_all = pickle.load(open('./saved_trajectories/' + str(pi_b) + ".pkl", 'rb'))
     
     # Calculate weights for all pairs in the calibration dataset
     b_o_returns = filtered_b_o_rs
@@ -320,18 +344,20 @@ if __name__ == '__main__':
     behavior_policy = D4RL_Policy(policy_path)
     policy_path = policy_metadatas[pi_e]['policy_path']
     target_policy = D4RL_Policy(policy_path)
+    print("Calculating Weights")
     for i in range (len(b_gen_returns)): # Should only be on the calibration dataset.
-        b_o = filtered_b_o_ts[i]
-        b_gen = filtered_b_gen_as[i]
+        b_o = filtered_b_o_ts[i] # Original env trajectory in match
+        b_gen = filtered_b_gen_ts[i] # Generated trajectory in match
         b_o_r = b_o_returns[i]
         b_gen_r = b_gen_returns[i]
         matched_returns, matched_trajectories, matched_actions = find_similar_trajectories(behavior_trajectories_all, b_gen, b_gen_r)
         assert len(matched_returns) > 0, "no matched trajectories when calculating weights!"
         all_terms = []
         for t, a, r in zip(matched_trajectories, matched_actions, matched_returns):
-            all_terms.append(calculate_ips_product(t, a, target_policy, behavior_policy) * np.pow(np.abs(b_gen_r, r), alpha_r*-1))
+            all_terms.append(calculate_ips_product(t, a, target_policy, behavior_policy) * (np.abs(b_gen_r - r) ** (alpha_r*-1)))
         w_hat = np.mean(all_terms) # This is the expectation over the filtered trajectories
         weights += [w_hat]
+    print("IPS weights, unnormalized, " + str(weights)) # All nans, because the IPS products are super low?
 
     # Normalize all the weights
     weights = np.asarray(weights)/np.sum(weights)
@@ -353,13 +379,16 @@ if __name__ == '__main__':
     rew_mean = d4rl_qlearning['rewards'].mean()
     rew_std = d4rl_qlearning['rewards'].std()
 
-    for _, i in enumerate(tqdm.tqdm(range(n_tries))): # Calculating the actual value using monte carlo sampling
-        target_reward, _, _ = generate_trajectory(target_policy, env, obs_std, obs_mean, MAX_EPISODE_LEN, env_state_dim, env_action_dim, rew_std, rew_mean)
-        true_target_rewards.append(target_reward)    
+#    TODO: double check that this is not symmetric?
+    print("First Term Approximation: " + str(np.mean(first_term_target_rewards)))
+    print("Interval: (" + str(np.mean(first_term_target_rewards) - np.quantile(new_weighted_errors, 1 - alpha)) + ", " + str((np.mean(first_term_target_rewards) + np.quantile(new_weighted_errors, 1-alpha))) + ")")
 
-    # import ipdb; ipdb.set_trace()
-    # TODO: double check that this is not symmetric?
-    print(np.mean(first_term_target_rewards), np.mean(first_term_target_rewards) - np.quantile(new_weighted_errors, 1 - alpha), (np.mean(first_term_target_rewards) + np.quantile(new_weighted_errors, 1-alpha)), np.mean(true_target_rewards))
+    for _, i in enumerate(tqdm.tqdm(range(n_tries))): # Calculating the actual value using monte carlo sampling
+        target_reward, _, _ = generate_trajectory(target_policy)
+        true_target_rewards.append(target_reward)   # This will be about 20. something
+
+    print("True target reward: " + str(np.mean(true_target_rewards)))
+
 
     # preds = np.asarray(preds)
     # truths = np.asarray(truths)
