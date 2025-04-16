@@ -152,7 +152,7 @@ def calculate_ips_product(t_t, t_a, target_policy, behavior_policy):
             ips_vals.append(min(10, max(1e-8, ips_weight))) # Clamping the IPS weights
     return np.exp(np.sum(ips_vals)) # add exp
 
-def find_similar_trajectories(data_dict, new_traj, new_reward, epsilon=0.8, epsilon_reward=1.5):
+def find_similar_trajectories(data_dict, new_traj, new_reward, epsilon=10, epsilon_reward=10):
     """
     data_dict: dict with keys 'returns', 'trajectories', 'actions'
         - 'returns': list of floats
@@ -172,9 +172,9 @@ def find_similar_trajectories(data_dict, new_traj, new_reward, epsilon=0.8, epsi
 
     for r, traj, a in zip(data_dict['returns'], data_dict['trajectories'], data_dict['actions']):
         # Compare first and last state (first 8 dims)
-        first_close = np.linalg.norm(traj[0][:8] - new_traj[0][:8]) < epsilon
+        first_close = np.linalg.norm(traj[0][:8] - new_traj[0][:8]) <= epsilon
         # last_close = np.linalg.norm(traj[-1][:8] - new_traj[-1][:8]) < epsilon
-        reward_close = abs(r - new_reward) < epsilon_reward
+        reward_close = abs(r - new_reward) <= epsilon_reward
 
         if first_close and reward_close: # last_close
             matched_returns.append(r)
@@ -206,7 +206,7 @@ if __name__ == '__main__':
     alpha = 0.05 # 95% coverage
     pi_e = 10
     pi_b = 9
-    generate_traj = True
+    generate_traj = False
     alpha_r = 6
 
     ENV = args.env
@@ -233,12 +233,15 @@ if __name__ == '__main__':
 
     graph_ope_models = tf.Graph()
 
+
     with graph_ope_models.as_default():
         tf.train.import_meta_graph(os.path.join(ope_path, "ope_best.ckpt.meta"))
         num_branch = np.asarray(list((set([int(v.name.split("/")[0].split("_")[-1]) for v in tf.trainable_variables() if v.name.find("Decoder_zt1_")!=-1])))).max()+1
 
     preds = []
     truths = []
+    behavior_policy = D4RL_Policy(policy_metadatas[pi_b]['policy_path'])
+    target_policy = D4RL_Policy(policy_metadatas[pi_e]['policy_path'])
     # Generate Trajectories Using the Learned Environment For Target Policy (first term)
     if generate_traj:
         for i in [pi_e]:
@@ -322,11 +325,12 @@ if __name__ == '__main__':
     filtered_b_o_rs, filtered_b_o_ts, filtered_b_o_as = zip(*results_b_o)
     filtered_b_gen_rs, filtered_b_gen_ts, filtered_b_gen_as = zip(*results_b_gen)
 
-    # Create a large set of trajectories from the original enviornment (TODO may need to change to the learned environment idk)
-    print("Creating pi_b dataset to calculate weights")
+    # Create a large set of trajectories from the learned environment
+    print("Creating pi_b dataset from learned environment to calculate weights")
     if generate_traj:
         pool = mp.Pool(30)
-        res = pool.map(generate_trajectory, [behavior_policy for _ in range(400)])
+        policy_path = policy_metadatas[pi_b]['policy_path']
+        res = pool.map(evaluate, [policy_path for _ in range(100)])
         behavior_dataset_returns, behavior_dataset_trajectories, behavior_dataset_actions = zip(*res)
         pool.close()
         pool.join()
@@ -381,7 +385,7 @@ if __name__ == '__main__':
 
 #    TODO: double check that this is not symmetric?
     print("First Term Approximation: " + str(np.mean(first_term_target_rewards)))
-    print("Interval: (" + str(np.mean(first_term_target_rewards) - np.quantile(new_weighted_errors, 1 - alpha)) + ", " + str((np.mean(first_term_target_rewards) + np.quantile(new_weighted_errors, 1-alpha))) + ")")
+    print("Interval: (" + str(np.mean(first_term_target_rewards) - np.quantile(new_weighted_errors, 1 - alpha)) + ", " + str((np.mean(first_term_target_rewards) - np.quantile(new_weighted_errors, alpha))) + ")")
 
     for _, i in enumerate(tqdm.tqdm(range(n_tries))): # Calculating the actual value using monte carlo sampling
         target_reward, _, _ = generate_trajectory(target_policy)
