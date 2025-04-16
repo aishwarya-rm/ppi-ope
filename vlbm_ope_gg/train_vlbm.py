@@ -22,7 +22,7 @@ import dill
 import collections
 import concurrent.futures
 from multiprocessing import Manager
-from utils import generate_and_check_trajectory, LearnedEnv
+from utils import generate_and_check_trajectory
 
 mp.set_start_method("spawn")
 slim = tf.contrib.slim
@@ -53,6 +53,24 @@ parser.add_argument("-max_episode_len", type=int, help="Maximum episode length, 
 parser.add_argument("-buffer_size", type=int, help="Maximum buffer size. Set to 3000 to make sure it can accomodate all offline trajectories used for training", default=3000)
 
 
+class LearnedEnv(object):
+    def __init__(self, model):
+        self.model = model
+
+    def reset(self):
+        s0 = self.model.init_z0_s0()
+
+        self.obs = s0
+        return s0
+
+    def step(self, u):
+        new_obs, reward = self.model.get_zt1_s2_r(np.reshape(u, (1, env_action_dim)))
+        self.obs = new_obs
+        self.model.update_zt()
+
+        return new_obs, reward, False, {}
+
+
 def sequence_dataset(env, dataset=None, **kwargs):
     """
     Returns an iterator through trajectories.
@@ -70,8 +88,8 @@ def sequence_dataset(env, dataset=None, **kwargs):
             rewards
             terminals
     """
-    if dataset is None:
-        dataset = env.get_dataset(**kwargs)
+    # if dataset is None:
+    #     dataset = env.get_dataset(**kwargs)
 
     N = dataset['rewards'].shape[0]
     data_ = collections.defaultdict(list)
@@ -88,7 +106,7 @@ def sequence_dataset(env, dataset=None, **kwargs):
         if use_timeouts:
             final_timestep = dataset['timeouts'][i]
         else:
-            final_timestep = (episode_step == env._max_episode_steps - 1)
+            final_timestep = (episode_step == env.H - 1)
 
         for k in dataset:
             if k.find("metadata")==-1:
@@ -103,6 +121,8 @@ def sequence_dataset(env, dataset=None, **kwargs):
             data_ = collections.defaultdict(list)
 
         episode_step += 1
+
+
 def evaluate(ope_eval, graph_ope_eval, sess_ope_eval, *args):
     
     # Validate and create checkpoints of VLBM during training
@@ -194,23 +214,6 @@ def calculate_policy_value(target_policy_path, behavior_policy_path, ope_model, 
         ope_saver.restore(sess_ope_model, os.path.join(ope_path, "ope_best.ckpt"))
 
     d4rl_qlearning = d4rl.qlearning_dataset(env)
-
-    class LearnedEnv(object):
-        def __init__(self, model):
-            self.model = model
-
-        def reset(self):
-            s0 = self.model.init_z0_s0()
-
-            self.obs = s0
-            return s0
-
-        def step(self, u):
-            new_obs, reward = self.model.get_zt1_s2_r(np.reshape(u, (1, env_action_dim)))
-            self.obs = new_obs
-            self.model.update_zt()
-
-            return new_obs, reward, False, {}
 
     learned_env = LearnedEnv(ope_model)
     ENV = args.env
@@ -321,6 +324,35 @@ def calculate_policy_value(target_policy_path, behavior_policy_path, ope_model, 
         return (np.mean(first_term_target_rewards) - np.quantile(errors, 1 - alpha), (np.mean(first_term_target_rewards) - np.quantile(errors, alpha))), np.mean(true_target_rewards)
 
 
+# train VAE to learn the dynamic of inventory control problem
+# s: inventory level, a: order quantity, r: reward, o: demand
+# N = 10, k = 1, c = 2, z = 2, p = 4, lambda = 10.
+# 0 \le a \le N
+# o ~ Poisson(lambda)
+# s' = max(0, min(N, s + a) - o)
+# r = -k * 1(a>0) - c * (min(N, s + a) - s) - z * s + p * o
+
+class Inventory_Simulator(object):
+    def __init__(self, N, k, c, z, p, lambda_, H):
+        self.N = N
+        self.k = k
+        self.c = c
+        self.z = z
+        self.p = p
+        self.lambda_ = lambda_
+        self.H = H
+
+    def reset(self): # return the initial state
+        return np.random.randint(0, self.N + 1)
+
+    def step(self, s, a, h): # transition function
+        o = np.random.poisson(self.lambda_)
+        s1 = max(0, min(self.N, s + a) - o)
+        r = -self.k * int(a > 0) - self.c * (min(self.N, s + a) - s) - self.z * s + self.p * o
+        done = (h == self.H - 1)
+        return s, a, r, s1, done
+
+
 if __name__ == '__main__':
     args = parser.parse_args()
     if not args.no_gpu:
@@ -342,19 +374,14 @@ if __name__ == '__main__':
     OPE_LR = args.lr
     OPE_DS = args.decay_step
     OPE_DR = args.decay_rate
-    TRAIN = False
+    TRAIN = True
 
     MAX_EPISODE_LEN = args.max_episode_len
     REPEAT = args.repeat # Action repeat is not needed since we are training on offline trajectories. So it's always set to 1.
     BUFFER_SIZE_OPE = args.buffer_size
     BEST_MAE = 9999. # Used later for validation and checkpoint saving
 
-    ENV = args.env
-
-    assert "halfcheetah" in ENV, "This script only work for Halfcheetah which does not perform early termination of episodes. To train on Ant, Hopper, Walker2d, please use the other script."
-
-    if "expert" in ENV:
-        sequence_dataset = d4rl.sequence_dataset
+    ENV = "inventory"
 
     if not os.path.exists("./rl_stats"):
         os.mkdir("./rl_stats")
@@ -377,15 +404,16 @@ if __name__ == '__main__':
     )
 
     graph_ope_models = tf.Graph()
-    env = gym.make(rl_params['env_name'])
+    # env = gym.make(rl_params['env_name'])
     np.random.seed(RANDOM_SEED)
     tf.set_random_seed(RANDOM_SEED)
-    env.seed(RANDOM_SEED)
+    # env.seed(RANDOM_SEED)
 
-    env_state_dim = env.observation_space.shape[0]
-    env_action_dim = env.action_space.shape[0]
-    env_action_bound = env.action_space.high
-    env_state_bound = None
+    env = Inventory_Simulator(10, 1, 2, 2, 4, 10, 20)
+    env_state_dim = 1
+    env_action_dim = 1
+    env_action_bound = 10
+    env_state_bound = 10
     if TRAIN:
         iters_already_passed = 0
 
@@ -399,13 +427,13 @@ if __name__ == '__main__':
         with tf.Session(config=config, graph=graph_ope_models) as sess_ope_models:
             with tf.Session(config=config, graph=graph_ope_models_eval) as sess_ope_models_eval:
 
-                d4rl_qlearning = d4rl.qlearning_dataset(env)
+                inventory_data = np.load("./inventory_data.npz") # TODO: assume we have inventory data, this should be generated by the simulator
 
-                obs_mean = d4rl_qlearning['observations'].mean(0).astype(np.float32)
-                obs_std = d4rl_qlearning['observations'].std(0).astype(np.float32)
+                obs_mean = inventory_data['observations'].mean(0).astype(np.float32)
+                obs_std = inventory_data['observations'].std(0).astype(np.float32)
 
-                rew_mean = d4rl_qlearning['rewards'].mean()
-                rew_std = d4rl_qlearning['rewards'].std()
+                rew_mean = inventory_data['rewards'].mean()
+                rew_std = inventory_data['rewards'].std()
 
                 with graph_ope_models.as_default():
 
@@ -420,7 +448,7 @@ if __name__ == '__main__':
                     sess_ope_models.run(tf.global_variables_initializer())
 
                     ope_model.replay_buffer.port_d4rl_data(
-                        sequence_dataset(env),
+                        sequence_dataset(env, dataset=inventory_data),
                         obs_mean,
                         obs_std,
                         rew_mean,
