@@ -285,16 +285,16 @@ if __name__ == '__main__':
     behavior_trajectories_diff = {}
     epsilon_r = 3
     if generate_traj:
-        print("Generating trajectories nwo")
+        print("Generating trajectories now")
         for i, b_o_t in enumerate(b_o_ts):
             s_0 = b_o_t[0] # This is the first state in the trajectory
             s_last = b_o_t[-1] # This is the last state in the trajectory
             behavior_return = b_o_rs[i] # This is the return of the trajectory
             policy_path = policy_metadatas[pi_b]['policy_path']
             behavior_policy = D4RL_Policy(policy_path)
-            scales = [np.random.normal(loc=0, scale=0.5) for _ in range(10)]
+            scales = [np.random.normal(loc=0, scale=0.5) for _ in range(5)]
             pool = mp.Pool(5)
-            res = pool.starmap(rollout_learned_env, [(policy_path, s_0, scales[ll]) for ll in range(10)]) # Used because function takes two arguments
+            res = pool.starmap(rollout_learned_env, [(policy_path, s_0, scales[ll]) for ll in range(5)]) # Used because function takes two arguments
             gen_returns, gen_trajs, gen_actions = zip(*res)
             pool.close()
             pool.join()
@@ -314,7 +314,8 @@ if __name__ == '__main__':
     weights = []
     for i in range(len(b_o_ts)): # For all trajectories in the behavior dataset
         # Get the trajectories that already match
-        if i not in behavior_trajectories_diff.keys():
+        if len(behavior_trajectories_diff[i]['returns']) == 0: # No matched trajectories
+            weights += [0] # We don't have matched trajectories
             continue
         else:
             matched_trajs = behavior_trajectories_diff[i]
@@ -328,13 +329,12 @@ if __name__ == '__main__':
                 expectation_over_matched_trajs)])  # This is the expectation over the filtered trajectories
             weights += [w_hat]
 
-    print("IPS weights, unnormalized, " + str(weights))  # All nans, because the IPS products are super low?
+    print("IPS weights, unnormalized, " + str(weights))
     # Normalize all the weights
     weights = np.asarray(weights)/np.sum(weights)
-
     new_weighted_errors = []
     for i in range(len(b_o_rs)):
-        if i not in behavior_trajectories_diff.keys():
+        if len(behavior_trajectories_diff[i]['returns']) == 0:  # No matched trajectories
             continue
         else:
             matched_trajectories = behavior_trajectories_diff[i]
