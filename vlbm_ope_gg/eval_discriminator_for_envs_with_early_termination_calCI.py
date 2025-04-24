@@ -33,6 +33,43 @@ parser.add_argument("-path", type=str, help="Path to checkpoint folder")
 parser.add_argument("-repeat", type=int, help="Set action repeat. Since we are training on offline trajectories, so this is not needed (always set to 1)", default=1)
 parser.add_argument("-max_episode_len", type=int, help="Maximum episode length, which is always 1000 for Gym-Mujoco environments", default=100)
 
+import numpy as np
+
+
+def weighted_quantile(values, quantiles, sample_weight=None):
+    """
+    Compute weighted quantiles.
+
+    Parameters
+    ----------
+    values : array-like
+        Data array.
+    quantiles : array-like
+        Quantiles to compute, which must be between 0 and 1.
+    sample_weight : array-like, optional
+        Weights for each data point. If None, equal weight is assumed.
+
+    Returns
+    -------
+    array-like
+        The weighted quantiles.
+    """
+    values = np.array(values)
+    quantiles = np.array(quantiles)
+
+    if sample_weight is None:
+        sample_weight = np.ones_like(values)
+    sample_weight = np.array(sample_weight)
+
+    sorter = np.argsort(values)
+    values = values[sorter]
+    sample_weight = sample_weight[sorter]
+
+    weighted_cdf = np.cumsum(sample_weight) - 0.5 * sample_weight
+    weighted_cdf /= np.sum(sample_weight)
+
+    return np.interp(quantiles, weighted_cdf, values)
+
 def rollout_learned_env(policy_path, starting_state=None, scale=None): # This just generates a trajectory using the given path and the learned OPE model.
     file_appendix = ""
 
@@ -192,37 +229,50 @@ def find_similar_trajectories(data_dict, new_traj, new_reward, epsilon=1.5, epsi
     return matched_returns, matched_trajectories, matched_actions
 
 def train_discriminator():
-    horizon = 4
     state_dim = 17
+    return_dim = 1
     pi_b = 9
     pi_e = 10
 
-    model = TrajectoryClassifier(state_dim * horizon)
+    model = TrajectoryClassifier(state_dim + return_dim)
     optimizer = torch.optim.Adam(model.parameters())
     criterion = torch.nn.BCELoss()
 
-    # TODO: should we include actions in this representation?
     # Trajectories from Target Policy and Learned Env = 1
     first_term_trajs = pickle.load(open('./saved_trajectories/' + str(pi_e) + "_first_term.pkl", 'rb'))
+
     trajectories_target = first_term_trajs['trajectories']
-    inputs_pi_e = torch.Tensor(np.asarray(list(trajectories_target)).reshape((-1, state_dim * horizon))[:150])
+    returns_target = first_term_trajs['returns']
+
+    # Each sample is [17-dim first state] + [1-dim return] flattened
+    trajectory_inputs = np.asarray(list(trajectories_target))[:150, 0, :]
+    return_inputs = np.asarray(returns_target)[:150]
+    inputs_pi_e = torch.Tensor(np.hstack((trajectory_inputs, return_inputs.reshape(-1, 1))))
     labels_pi_e = torch.Tensor(np.ones(inputs_pi_e.shape[0]))
 
     # Trajectories from Original Env and Behavior Policy = 0
     behavior_trajectories_o = pickle.load(
         open('./saved_trajectories/' + str(pi_b) + "_o.pkl", 'rb'))  # This is always going to be similar?
     trajectories_behavior = behavior_trajectories_o['trajectories']
-    inputs_pi_b = torch.Tensor(np.asarray(list(trajectories_behavior)).reshape((-1, state_dim * horizon))[:150])
+    returns_behavior = behavior_trajectories_o['returns']
+    trajectory_inputs = np.asarray(list(trajectories_behavior))[:150, 0, :]
+    return_inputs = np.asarray(returns_behavior)[:150]
+    inputs_pi_b = torch.Tensor(np.hstack((trajectory_inputs, return_inputs.reshape(-1, 1))))
     labels_pi_b = torch.Tensor(np.zeros(inputs_pi_b.shape[0]))
 
     # Validation set
-    val_pi_e = torch.Tensor(np.asarray(list(trajectories_target)).reshape((-1, state_dim * horizon))[150:])
+    trajectory_inputs = np.asarray(list(trajectories_target))[150:, 0, :]
+    return_inputs = np.asarray(returns_target)[150:]
+    val_pi_e = torch.Tensor(np.hstack((trajectory_inputs, return_inputs.reshape(-1, 1))))
     val_label_pi_e = torch.Tensor(np.ones(val_pi_e.shape[0]))
-    val_pi_b = torch.Tensor(np.asarray(list(trajectories_behavior)).reshape((-1, state_dim * horizon))[150:])
+
+    trajectory_inputs = np.asarray(list(trajectories_behavior))[150:, 0, :]
+    return_inputs = np.asarray(returns_behavior)[150:]
+    val_pi_b = torch.Tensor(np.hstack((trajectory_inputs, return_inputs.reshape(-1, 1))))
     val_label_pi_b = torch.Tensor(np.zeros(val_pi_b.shape[0]))
 
     # Training Loop
-    for epoch in range(100):
+    for epoch in range(300):
         preds = model(torch.cat([inputs_pi_e, inputs_pi_b])).squeeze(-1)
         loss = criterion(preds, torch.cat([labels_pi_e, labels_pi_b]))
         optimizer.zero_grad()
@@ -248,6 +298,7 @@ def train_discriminator():
         accuracy = (predicted_labels == val_labels).float().mean()
 
     print(f"Validation Loss: {val_loss.item():.4f}, Accuracy: {accuracy.item():.4f}")  # This is not bad as a model.
+
     return model
 
 if __name__ == '__main__':
@@ -369,21 +420,23 @@ if __name__ == '__main__':
     print("Finished generating matching trajectories")
 
     discriminator = train_discriminator()
-
-    weighted_errors = []
+    weights = []
+    scores = []
     for i in range(len(b_o_rs)):
         behavior_trajectory = b_o_ts[i]
         if len(behavior_trajectories_diff[i]['returns']) == 0:  # No matched trajectories
             continue
         else:
             matched_trajectories = behavior_trajectories_diff[i]
-            p_hat = discriminator(torch.Tensor(np.asarray(behavior_trajectory).reshape((-1, 4*17))))[0].squeeze(-1).detach().item()
-            weight = p_hat / (1-p_hat)
+            s_o = behavior_trajectory[0].flatten() # First state of the behavior trajectory
             # For every trajectory that matched
             for j in range(len(matched_trajectories['returns'])):
-                weighted_errors.append(weight * np.abs(b_o_rs[i] - matched_trajectories['returns'][j])) # This should be the absolute value of the difference between returns
-
-    print("weighted_errors ",weighted_errors)
+                return_j = matched_trajectories['returns'][j]
+                input = np.hstack((s_o.reshape(1, -1), return_j.reshape(1, -1)))
+                p_hat = discriminator(torch.Tensor(input))[0].squeeze(-1).detach().item()
+                weight = p_hat / (1 - p_hat)
+                weights.append(weight)
+                scores.append(np.abs(b_o_rs[i] - matched_trajectories['returns'][j])) # Absolute value of differences in returns
 
     true_target_rewards = []
     d4rl_qlearning = d4rl.qlearning_dataset(env)
@@ -394,7 +447,8 @@ if __name__ == '__main__':
     rew_std = d4rl_qlearning['rewards'].std()
 
     print("First Term Approximation: " + str(np.mean(first_term_target_rewards)))
-    print("Interval: (" + str(np.mean(first_term_target_rewards) - np.quantile(weighted_errors, 1 - alpha)) + ", " + str((np.mean(first_term_target_rewards) - np.quantile(weighted_errors, alpha))) + ")")
+    quantiles = weighted_quantile(scores, [1-alpha, alpha], weights)
+    print("Interval: (" + str(quantiles[0]) + ", " + str(quantiles[1]) + ")")
     import ipdb; ipdb.set_trace()
     for _, i in enumerate(tqdm.tqdm(range(n_tries))): # Calculating the actual value using monte carlo sampling
         target_reward, _, _ = rollout_original_env(target_policy)
