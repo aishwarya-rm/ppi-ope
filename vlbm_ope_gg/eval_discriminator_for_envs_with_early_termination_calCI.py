@@ -197,42 +197,9 @@ def calculate_ips_product(t_t, t_a, target_policy, behavior_policy):
 
     return np.exp(ips_weight_target - ips_weight_behavior)
 
-def find_similar_trajectories(data_dict, new_traj, new_reward, epsilon=1.5, epsilon_reward=1.5):
-    """
-    data_dict: dict with keys 'returns', 'trajectories', 'actions'
-        - 'returns': list of floats
-        - 'trajectories': list of np.ndarrays, each of shape (T, D)
-        - 'actions': list of integers or list-like
-    new_traj: np.ndarray of shape (T, D)
-    new_reward: float
-    epsilon: float, threshold for comparing first and last state (only first 8 dims)
-    epsilon_reward: float, threshold for comparing reward
-
-    Returns:
-        A filtered dict with the same keys, containing only matching elements
-    """
-    matched_returns = []
-    matched_trajectories = []
-    matched_actions = []
-
-    for r, traj, a in zip(data_dict['returns'], data_dict['trajectories'], data_dict['actions']):
-        # Compare first and last state (first 8 dims)
-        first_close = np.linalg.norm(traj[0][:8] - new_traj[0][:8]) <= epsilon
-        # last_close = np.linalg.norm(traj[-1][:8] - new_traj[-1][:8]) < epsilon
-        reward_close = abs(r - new_reward) <= epsilon_reward
-
-        if first_close and reward_close: # last_close
-            matched_returns.append(r)
-            matched_trajectories.append(traj)
-            matched_actions.append(a)
-
-    return matched_returns, matched_trajectories, matched_actions
-
-def train_discriminator():
+def train_discriminator(pi_b, pi_e):
     state_dim = 17
     return_dim = 1
-    pi_b = 9
-    pi_e = 10
 
     model = TrajectoryClassifier(state_dim + return_dim)
     optimizer = torch.optim.Adam(model.parameters())
@@ -318,14 +285,10 @@ if __name__ == '__main__':
     REPEAT = args.repeat # Action repeat is not needed since we are training on offline trajectories. So it's always set to 1.
     CODE_SIZE = args.code_size
     MAX_EPISODES = args.max_episodes
-    epsilon = 0.8
-    n_tries = 40
-    n_tries_parallel = 70
+    n_tries_parallel = 100
     alpha = 0.05 # 95% coverage
     pi_e = 10
-    pi_b = 9
-    generate_traj = False
-    alpha_r = 0
+    generate_traj = True
 
     ENV = args.env
     ope_path = args.path
@@ -352,7 +315,6 @@ if __name__ == '__main__':
         tf.train.import_meta_graph(os.path.join(ope_path, "ope_best.ckpt.meta"))
         num_branch = np.asarray(list((set([int(v.name.split("/")[0].split("_")[-1]) for v in tf.trainable_variables() if v.name.find("Decoder_zt1_")!=-1])))).max()+1
 
-    behavior_policy = D4RL_Policy(policy_metadatas[pi_b]['policy_path'])
     target_policy = D4RL_Policy(policy_metadatas[pi_e]['policy_path'])
 
     # Generate Trajectories Using the Learned Environment For Target Policy (first term)
@@ -372,85 +334,55 @@ if __name__ == '__main__':
     t_ts = first_term_trajs['trajectories']
     t_as = first_term_trajs['actions']
     first_term_target_rewards = t_rs  # Calculating the first term
-    print("Calculating first term")
+    print("Calculated first term")
 
     # Generate Trajectories Using the Ground Truth Environment for the Behavior Policy
     if generate_traj:
-        pool = mp.Pool(30)
-        res = pool.map(rollout_original_env, [behavior_policy for _ in range(n_tries_parallel)])
-        b_o_rs, b_o_ts, b_o_as = zip(*res)
-        pool.close()
-        pool.join()
-        behavior_trajectories_o = {'returns': b_o_rs, 'trajectories': b_o_ts, 'actions': b_o_as}
-        pickle.dump(behavior_trajectories_o, open('./saved_trajectories/' + str(pi_b) + "_o.pkl", 'wb'))
-
-    behavior_trajectories_o = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_o.pkl", 'rb')) # This is always going to be similar?
-    b_o_rs = behavior_trajectories_o['returns']
-    b_o_ts = behavior_trajectories_o['trajectories']
-    b_o_as = behavior_trajectories_o['actions']
-    print("Offline data")
-
-    # Generate Trajectories Using the Learned Environment that already match in the first state, and filter to find stuff that matches in the return
-    behavior_trajectories_diff = {}
-    epsilon_r = 3
-    if generate_traj:
-        print("Generating trajectories now")
-        for i, b_o_t in enumerate(b_o_ts):
-            s_0 = b_o_t[0] # This is the first state in the trajectory
-            s_last = b_o_t[-1] # This is the last state in the trajectory
-            behavior_return = b_o_rs[i] # This is the return of the trajectory
-            policy_path = policy_metadatas[pi_b]['policy_path']
-            behavior_policy = D4RL_Policy(policy_path)
-            scales = [np.random.normal(loc=0, scale=0.5) for _ in range(5)]
-            pool = mp.Pool(5)
-            res = pool.starmap(rollout_learned_env, [(policy_path, s_0, scales[ll]) for ll in range(5)]) # Used because function takes two arguments
-            gen_returns, gen_trajs, gen_actions = zip(*res)
+        for pi_b in [i for i in range(10)]:
+            behavior_policy = D4RL_Policy(policy_metadatas[pi_b]['policy_path'])
+            pool = mp.Pool(30)
+            res = pool.map(rollout_original_env, [behavior_policy for _ in range(n_tries_parallel)])
+            b_o_rs, b_o_ts, b_o_as = zip(*res)
             pool.close()
             pool.join()
-            behavior_trajectories_diff[i] = {'returns':[], 'trajectories':[], 'actions':[]}
-            for j in range(len(gen_returns)):
-                if np.abs(gen_returns[j] - behavior_return) < epsilon_r: # If the rewards are pretty close
-                    behavior_trajectories_diff[i]['returns'].append(gen_returns[j])
-                    behavior_trajectories_diff[i]['trajectories'].append(gen_trajs[j])
-                    behavior_trajectories_diff[i]['actions'].append(gen_actions[j])
-            if len(behavior_trajectories_diff[i]['returns']) == 0:
-                print("Trajectory: " + str(i) + " had no matched trajectories")
-            pickle.dump(behavior_trajectories_diff, open('./saved_trajectories/' + str(pi_b) + "_diff.pkl", 'wb'))
-    behavior_trajectories_diff = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_diff.pkl", 'rb')) # For every sample in the behavior dataset, there are > 0 trajectories that match
-    print("Finished generating matching trajectories")
+            behavior_trajectories_o = {'returns': b_o_rs, 'trajectories': b_o_ts, 'actions': b_o_as}
+            pickle.dump(behavior_trajectories_o, open('./saved_trajectories/' + str(pi_b) + "_o.pkl", 'wb'))
 
-    discriminator = train_discriminator()
-    weights = []
-    scores = []
-    for i in range(len(b_o_rs)):
-        behavior_trajectory = b_o_ts[i]
-        if len(behavior_trajectories_diff[i]['returns']) == 0:  # No matched trajectories
-            continue
-        else:
-            matched_trajectories = behavior_trajectories_diff[i]
+    for pi_b in [i for i in range(10)]:
+        behavior_trajectories_o = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_o.pkl", 'rb')) # This is always going to be similar?
+        b_o_rs = behavior_trajectories_o['returns']
+        b_o_ts = behavior_trajectories_o['trajectories']
+        b_o_as = behavior_trajectories_o['actions']
+        print("Offline data")
+
+        discriminator = train_discriminator(pi_b=pi_b, pi_e=pi_e)
+        weights = []
+        scores = []
+        for i in range(len(b_o_rs)):
+            behavior_trajectory = b_o_ts[i]
+            # if len(behavior_trajectories_diff[i]['returns']) == 0:  # No matched trajectories
+            #     continue
+            # else:
             s_o = behavior_trajectory[0].flatten() # First state of the behavior trajectory
-            # For every trajectory that matched
-            for j in range(len(matched_trajectories['returns'])):
-                return_j = matched_trajectories['returns'][j]
-                input = np.hstack((s_o.reshape(1, -1), return_j.reshape(1, -1)))
-                p_hat = discriminator(torch.Tensor(input))[0].squeeze(-1).detach().item()
-                weight = p_hat / (1 - p_hat)
-                weights.append(weight)
-                scores.append(np.abs(b_o_rs[i] - matched_trajectories['returns'][j])) # Absolute value of differences in returns
+            return_i = b_o_rs[i]
+            input = np.hstack((s_o.reshape(1, -1), return_i.reshape(1, -1)))
+            p_hat = discriminator(torch.Tensor(input))[0].squeeze(-1).detach().item()
+            weight = p_hat / (1 - p_hat)
+            weights.append(weight)
+            scores.append(b_o_rs[i]) # Absolute value of differences in returns
+
+        quantiles = weighted_quantile(scores, [alpha, 1-alpha], weights)
+        print("pi_b=" + str(pi_b) + " pi_e=" + str(pi_e) + " Interval: (" + str(quantiles[0]) + ", " + str(quantiles[1]) + ")")
+
+    print("Calculate Ground Truth Value of Policy")
 
     true_target_rewards = []
     d4rl_qlearning = d4rl.qlearning_dataset(env)
-            
     obs_mean = d4rl_qlearning['observations'].mean(0).astype(np.float32)
     obs_std = d4rl_qlearning['observations'].std(0).astype(np.float32)
     rew_mean = d4rl_qlearning['rewards'].mean()
     rew_std = d4rl_qlearning['rewards'].std()
-
-    print("First Term Approximation: " + str(np.mean(first_term_target_rewards)))
-    quantiles = weighted_quantile(scores, [1-alpha, alpha], weights)
-    print("Interval: (" + str(quantiles[0]) + ", " + str(quantiles[1]) + ")")
-    import ipdb; ipdb.set_trace()
-    for _, i in enumerate(tqdm.tqdm(range(n_tries))): # Calculating the actual value using monte carlo sampling
+    for _, i in enumerate(tqdm.tqdm(range(n_tries_parallel))): # Calculating the actual value using monte carlo sampling
         target_reward, _, _ = rollout_original_env(target_policy)
         true_target_rewards.append(target_reward)   # This will be about 20. something
 
