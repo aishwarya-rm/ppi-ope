@@ -1,6 +1,5 @@
 import tensorflow as tf
 import numpy as np
-import gym
 import tqdm
 # from VLBM_for_envs_with_early_termination import *
 from VLBM import *
@@ -8,11 +7,10 @@ import os
 import tensorflow_probability as tfp
 import multiprocessing as mp
 import os
-import d4rl
 import json
 import argparse
 from scipy.stats import spearmanr
-from utils import generate_and_check_trajectory
+from utils import generate_trajectory
 
 # TODO: may need to take out randomness in trajectory generation if IPS weights get too big.
 # TODO: need to hyperparameter tune epsilon_r, alpha_r
@@ -32,22 +30,20 @@ parser.add_argument("-max_episodes", type=int, help="Maximum number of episodes 
 parser.add_argument("-path", type=str, help="Path to checkpoint folder")
 # Below are some constants that would not be changed
 parser.add_argument("-repeat", type=int, help="Set action repeat. Since we are training on offline trajectories, so this is not needed (always set to 1)", default=1)
-parser.add_argument("-max_episode_len", type=int, help="Maximum episode length, which is always 1000 for Gym-Mujoco environments", default=100)
+parser.add_argument("-max_episode_len", type=int, help="Maximum episode length, which is always 1000 for Gym-Mujoco environments", default=20)
 
-def evaluate(policy_path): # This just generates a trajectory using the given path and the learned OPE model.
+def evaluate(policy): # This just generates a trajectory using the given path and the learned OPE model.
     file_appendix = ""
 
-    env = gym.make(rl_params['env_name'])
+    # env = gym.make(rl_params['env_name'])
     # np.random.seed(RANDOM_SEED)
     # tf.set_random_seed(RANDOM_SEED)
     # env.seed(RANDOM_SEED)
 
-    env_state_dim = env.observation_space.shape[0]
-    if "ant-" in rl_params['env_name']:
-        env_state_dim = 27
-    env_action_dim = env.action_space.shape[0]
-    env_action_bound = env.action_space.high
-    env_state_bound = None
+    env_state_dim = 1
+    env_action_dim = 1
+    env_action_bound = 10
+    env_state_bound = 10
 
     graph_ope_models = tf.Graph()
 
@@ -67,20 +63,14 @@ def evaluate(policy_path): # This just generates a trajectory using the given pa
             ope_saver = ope_model.saver
             ope_saver.restore(sess_ope_models, os.path.join(ope_path, "ope_best.ckpt"))
 
-            d4rl_qlearning = d4rl.qlearning_dataset(env)
-            
-            if "ant-" in rl_params['env_name']:
+            inventory_data = dict(np.load("data/inventory_data.npz", allow_pickle=True))
+            print(inventory_data.keys())
 
-                obs_mean = d4rl_qlearning['observations'].mean(0).astype(np.float32)[:27]
-                obs_std = d4rl_qlearning['observations'].std(0).astype(np.float32)[:27]
-                
-            else:
-                
-                obs_mean = d4rl_qlearning['observations'].mean(0).astype(np.float32)
-                obs_std = d4rl_qlearning['observations'].std(0).astype(np.float32)
+            obs_mean = np.mean(inventory_data['observations'])
+            obs_std = np.std(inventory_data['observations'])
 
-            rew_mean = d4rl_qlearning['rewards'].mean()
-            rew_std = d4rl_qlearning['rewards'].std()
+            rew_mean = np.mean(inventory_data['rewards'])
+            rew_std = np.std(inventory_data['rewards'])
 
 
             class LearnedEnv(object):
@@ -106,32 +96,27 @@ def evaluate(policy_path): # This just generates a trajectory using the given pa
             tf.set_random_seed(RANDOM_SEED)
 
             ep_rewards = []
-            policy = D4RL_Policy(policy_path)
 
             terminal = 0
 
             s = learned_env.reset()
             s = s.reshape(env_state_dim)*obs_std + obs_mean
             ep_reward = 0
-            trajectory = [s] # test
-            trajectory_actions = [] # test
+            trajectory = [] 
+            trajectory_actions = [] 
 
             for j in tqdm.tqdm(range(MAX_EPISODE_LEN)):
 
                 if j % REPEAT == 0:
-                    if "ant-" in rl_params['env_name']:
-                        a, _, _ = policy.act(np.concatenate([np.reshape(s, (env_state_dim,)), np.zeros(policy.fc0_w.shape[1]-27)]), np.zeros((env_action_dim,)))
-                    else:
-                        a, _, _ = policy.act(np.reshape(s, (env_state_dim,)), np.zeros((env_action_dim,)))
-                trajectory_actions.append(a) # test
+                    a = policy.act(np.reshape(s, (env_state_dim,)))
+                trajectory_actions.append(a) 
                 s2, r, terminal, info = learned_env.step(a)
-                r = r*rew_std + rew_mean
+                r = r*rew_std + rew_mean # This is the reward in the original space
                 s2 = s2.reshape(env_state_dim)*obs_std + obs_mean
 
                 ep_reward += r*(GAMMA**j)
-
+                trajectory.append(s*obs_std + obs_mean) # This is the state in the original space
                 s = s2
-                trajectory.append(s) # test
 
                 if terminal or j == MAX_EPISODE_LEN-1:
                     ep_rewards += [ep_reward]
@@ -172,7 +157,7 @@ def find_similar_trajectories(data_dict, new_traj, new_reward, epsilon=0.8, epsi
 
     for r, traj, a in zip(data_dict['returns'], data_dict['trajectories'], data_dict['actions']):
         # Compare first and last state (first 8 dims)
-        first_close = np.linalg.norm(traj[0][:8] - new_traj[0][:8]) < epsilon
+        first_close = np.linalg.norm(traj[0][:1] - new_traj[0][:1]) < epsilon
         # last_close = np.linalg.norm(traj[-1][:8] - new_traj[-1][:8]) < epsilon
         reward_close = abs(r - new_reward) < epsilon_reward
 
@@ -182,6 +167,29 @@ def find_similar_trajectories(data_dict, new_traj, new_reward, epsilon=0.8, epsi
             matched_actions.append(a)
 
     return matched_returns, matched_trajectories, matched_actions
+    
+
+class uniform_policy(object):
+    def __init__(self, a, b):
+        self.a = a
+        self.b = b
+
+    def act(self, s):
+        a = np.random.uniform(self.a, self.b, (1,))
+        return a
+
+class sS_policy(object):
+    def __init__(self, s, S):
+        self.a = s
+        self.b = S
+
+    def act(self, s):
+        if s < self.a:
+            a = self.b - s
+        else:
+            a = np.random.uniform(0, 0, (1,))
+        return a
+        
 
 if __name__ == '__main__':
     args = parser.parse_args()
@@ -202,34 +210,29 @@ if __name__ == '__main__':
     MAX_EPISODES = args.max_episodes
     epsilon = 0.8
     n_tries = 100
-    n_tries_parallel = 70
+    n_tries_parallel = 1000
     alpha = 0.05 # 95% coverage
-    pi_e = 10
-    pi_b = 9
-    generate_traj = True
     alpha_r = 6
 
-    ENV = args.env
-    ope_path = args.path
+    ENV = "inventory"
+    ope_path = "./saved_model/VLBM_inventory_1000iter_0.0001_1000_0.997_16_1.0_2599/"
     rl_params = {
         'env_name':ENV,
     }
 
-    with tf.io.gfile.GFile("./d4rl_policies.json", 'r') as f:
-        policy_database = json.load(f)
-    policy_metadatas = [i for i in policy_database if i['task.task_names'][0].find(rl_params['env_name'].split("-")[0]+"-")!=-1]
+    # with tf.io.gfile.GFile("./d4rl_policies.json", 'r') as f:
+    #     policy_database = json.load(f)
+    # policy_metadatas = [i for i in policy_database if i['task.task_names'][0].find(rl_params['env_name'].split("-")[0]+"-")!=-1]
 
-    env = gym.make(rl_params['env_name'])
-    # np.random.seed(RANDOM_SEED)
-    # tf.set_random_seed(RANDOM_SEED)
+    # env = gym.make(rl_params['env_name'])
+    np.random.seed(RANDOM_SEED)
+    tf.set_random_seed(RANDOM_SEED)
     # env.seed(RANDOM_SEED)
 
-    env_state_dim = env.observation_space.shape[0]
-    if "ant-" in rl_params['env_name']:
-        env_state_dim = 27
-    env_action_dim = env.action_space.shape[0]
-    env_action_bound = env.action_space.high
-    env_state_bound = None
+    env_state_dim = 1
+    env_action_dim = 1
+    env_action_bound = 10
+    env_state_bound = 10
 
     graph_ope_models = tf.Graph()
 
@@ -237,24 +240,43 @@ if __name__ == '__main__':
         tf.train.import_meta_graph(os.path.join(ope_path, "ope_best.ckpt.meta"))
         num_branch = np.asarray(list((set([int(v.name.split("/")[0].split("_")[-1]) for v in tf.trainable_variables() if v.name.find("Decoder_zt1_")!=-1])))).max()+1
 
+    pi_u_0_10 = uniform_policy(0, 10)
+    pi_u_0_5 = uniform_policy(0, 5)
+    pi_u_3_8 = uniform_policy(3, 8)
+    pi_u_0_0 = uniform_policy(0, 0)
+    pi_u_6_6 = uniform_policy(6, 6)
+
+    pi_sS_3_10 = sS_policy(3, 10)
+    pi_sS_3_6 = sS_policy(3, 6)
+    pi_sS_7_10 = sS_policy(7, 10)
+    pi_sS_1_5 = sS_policy(1, 5)
+    pi_sS_5_8 = sS_policy(5, 8)
+
+    policies = [pi_u_0_10, pi_u_0_5, pi_u_3_8, pi_u_0_0, pi_u_6_6,
+            pi_sS_3_10, pi_sS_3_6, pi_sS_7_10, pi_sS_1_5, pi_sS_5_8]
+    
+    pi_e = 9
+    pi_b = 0
+        
     preds = []
-    truths = []
+    with open("./data/inventory_values.json", 'r') as f:
+        truths = dict(json.load(f))
+    # truths_list = []
     # Generate Trajectories Using the Learned Environment For Target Policy (first term)
+    generate_traj = True
     if generate_traj:
         for i in [pi_e]:
             print("target policy start generation, policy=" + str(i))
 
-            policy_path = policy_metadatas[i]['policy_path']
-            target_policy = D4RL_Policy(policy_path)
-            print("********{}********".format(policy_metadatas[i]['policy_path']))
+            target_policy = policies[i]
 
-            truths += [np.loadtxt("./truth_discounted/" + policy_path + ".txt")[0]]
+            # truths_list += [truths['sS_policy_5_8']]
 
             pool = mp.Pool(30)
-            res = pool.map(evaluate, [policy_path for _ in range(n_tries_parallel)])
+            res = pool.map(evaluate, [target_policy for _ in range(n_tries_parallel)])
             t_rs, t_ts, t_as = zip(*res)
             first_term_trajs = {'returns': t_rs, 'trajectories': t_ts, 'actions': t_as}
-            pickle.dump(first_term_trajs, open('./saved_trajectories/' + str(pi_e) + "_first_term.pkl", 'wb'))
+            pickle.dump(first_term_trajs, open('./saved_trajectories/' + str(pi_e) + "_first_term.pkl", 'wb+'))
             pool.close()
             pool.join()
 
@@ -265,20 +287,20 @@ if __name__ == '__main__':
     first_term_target_rewards = t_rs  # Calculating the first term
 
     # Generate Trajectories Using the Learned Environment For Behavior Policy
+    generate_traj = True
     if generate_traj:
         for i in [pi_b]:
             print("behavior policy start generation, policy=" + str(i))
-            policy_path = policy_metadatas[i]['policy_path']
-            behavior_policy = D4RL_Policy(policy_path)
-            print("********{}********".format(policy_metadatas[i]['policy_path']))
-            truths += [np.loadtxt("./truth_discounted/" + policy_path + ".txt")[0]]
+            
+            behavior_policy = policies[i]
+            # truths += []
             pool = mp.Pool(30)
-            res = pool.map(evaluate, [policy_path for _ in range(n_tries_parallel)])
+            res = pool.map(evaluate, [behavior_policy for _ in range(n_tries_parallel)])
             b_gen_rs, b_gen_ts, b_gen_as = zip(*res)
             pool.close()
             pool.join()
             behavior_trajectories_diff = {'returns':b_gen_rs, 'trajectories':b_gen_ts, 'actions':b_gen_as}
-            pickle.dump(behavior_trajectories_diff, open('./saved_trajectories/' + str(pi_b) + "_diff.pkl", 'wb'))
+            pickle.dump(behavior_trajectories_diff, open('./saved_trajectories/' + str(pi_b) + "_diff.pkl", 'wb+'))
     behavior_trajectories_diff = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_diff.pkl", 'rb'))
     b_gen_rs = behavior_trajectories_diff['returns']
     b_gen_ts = behavior_trajectories_diff['trajectories']
@@ -286,14 +308,15 @@ if __name__ == '__main__':
 
 
     # Generate Trajectories Using the Ground Truth Environment for the Behavior Policy
+    generate_traj = False
     if generate_traj:
         pool = mp.Pool(30)
-        res = pool.map(generate_trajectory, [behavior_policy for _ in range(n_tries_parallel)])
+        res = pool.map(generate_trajectory, [policies[pi_b] for _ in range(n_tries_parallel)])
         b_o_rs, b_o_ts, b_o_as = zip(*res)
         pool.close()
         pool.join()
         behavior_trajectories_o = {'returns': b_o_rs, 'trajectories': b_o_ts, 'actions': b_o_as}
-        pickle.dump(behavior_trajectories_o, open('./saved_trajectories/' + str(pi_b) + "_o.pkl", 'wb'))
+        pickle.dump(behavior_trajectories_o, open('./saved_trajectories/' + str(pi_b) + "_o.pkl", 'wb+'))
     behavior_trajectories_o = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_o.pkl", 'rb')) # This is always going to be similar?
     b_o_rs = behavior_trajectories_o['returns']
     b_o_ts = behavior_trajectories_o['trajectories']
@@ -302,48 +325,61 @@ if __name__ == '__main__':
     results_b_o = []
     results_b_gen = []
     print("Creating Calibration Dataset")
-    # Search among the trajectories that you have generated to create a calbiration dataset.
-    for i in range(n_tries_parallel):
-        b_o_r, b_o_t, b_o_a = b_o_rs[i], b_o_ts[i], b_o_as[i]
-        b_gen_r, b_gen_t, b_gen_a = b_gen_rs[i], b_gen_ts[i], b_gen_as[i]
-        if (np.linalg.norm(b_o_t[0][:8] - b_gen_t[0][:8]) < epsilon): # Fixed this, there was a bug in how we were comparing trajectories
-            if (np.linalg.norm(b_o_t[-1][:8] - b_gen_t[-1][:8]) < epsilon):
-                obj = {'b_o_r':b_o_r, 'b_o_t':b_o_t, 'b_o_a':b_o_a, 'b_gen_r':b_gen_r, 'b_gen_t':b_gen_t, 'b_gen_a':b_gen_a}
-                if not os.path.exists("./calibration_dataset/"):
-                    os.mkdir("./calibration_dataset/")
-                pickle.dump(obj, open("./calibration_dataset/" + str(i) + ".pkl", 'wb'))
-                results_b_o += [(b_o_r, b_o_t, b_o_a)]
-                results_b_gen += [(b_gen_r, b_gen_t, b_gen_a)]
+    generate_cal = False
+    if generate_cal:
+        # Search among the trajectories that you have generated to create a calbiration dataset.
+        for i in range(70):
+            b_o_r, b_o_t, b_o_a = b_o_rs[i], b_o_ts[i], b_o_as[i]
+            for j in range(n_tries_parallel):
+                b_gen_r, b_gen_t, b_gen_a = b_gen_rs[j], b_gen_ts[j], b_gen_as[j]
+                if (np.linalg.norm(b_o_t[0][:1] - b_gen_t[0][:1]) < epsilon):
+                    obj = {'b_o_r':b_o_r, 'b_o_t':b_o_t, 'b_o_a':b_o_a, 'b_gen_r':b_gen_r, 'b_gen_t':b_gen_t, 'b_gen_a':b_gen_a}
+                    if not os.path.exists("./calibration_dataset/"):
+                        os.mkdir("./calibration_dataset/")
+                    pickle.dump(obj, open("./calibration_dataset/" + str(i) + ".pkl", 'wb+'))
+                    results_b_o += [(b_o_r, b_o_t, b_o_a)]
+                    results_b_gen += [(b_gen_r, b_gen_t, b_gen_a)]
 
-    assert len(results_b_o) > 0, "results_b_o length is zero!"
-    assert len(results_b_gen) > 0, "results_b_gen length is zero!"
-    print("len of found matched trajectories: ", len(results_b_o))
+        assert len(results_b_o) > 0, "results_b_o length is zero!"
+        assert len(results_b_gen) > 0, "results_b_gen length is zero!"
+        print("len of found matched trajectories: ", len(results_b_o))
+    else:
+        # Load the calibration dataset
+        results_b_o = []
+        results_b_gen = []
+        for i in range(70):
+            obj = pickle.load(open("./calibration_dataset/" + str(i) + ".pkl", 'rb'))
+            b_o_r, b_o_t, b_o_a = obj['b_o_r'], obj['b_o_t'], obj['b_o_a']
+            b_gen_r, b_gen_t, b_gen_a = obj['b_gen_r'], obj['b_gen_t'], obj['b_gen_a']
+            results_b_o += [(b_o_r, b_o_t, b_o_a)]
+            results_b_gen += [(b_gen_r, b_gen_t, b_gen_a)]
+            print("len of found matched trajectories: ", len(results_b_o))
 
     filtered_b_o_rs, filtered_b_o_ts, filtered_b_o_as = zip(*results_b_o)
     filtered_b_gen_rs, filtered_b_gen_ts, filtered_b_gen_as = zip(*results_b_gen)
 
     # Create a large set of trajectories from the original enviornment (TODO may need to change to the learned environment idk)
     print("Creating pi_b dataset to calculate weights")
+    generate_traj = False
     if generate_traj:
         pool = mp.Pool(30)
-        res = pool.map(generate_trajectory, [behavior_policy for _ in range(400)])
+        res = pool.map(generate_trajectory, [policies[pi_b] for _ in range(400)])
         behavior_dataset_returns, behavior_dataset_trajectories, behavior_dataset_actions = zip(*res)
         pool.close()
         pool.join()
         if not os.path.exists('./saved_trajectories'):
             os.mkdir('./saved_trajectories')
         behavior_trajectories_all = {'returns':behavior_dataset_returns, 'trajectories':behavior_dataset_trajectories, 'actions':behavior_dataset_actions}
-        pickle.dump(behavior_trajectories_all, open('./saved_trajectories/' + str(pi_b) + ".pkl", 'wb'))
+        pickle.dump(behavior_trajectories_all, open('./saved_trajectories/' + str(pi_b) + ".pkl", 'wb+'))
     behavior_trajectories_all = pickle.load(open('./saved_trajectories/' + str(pi_b) + ".pkl", 'rb'))
     
     # Calculate weights for all pairs in the calibration dataset
     b_o_returns = filtered_b_o_rs
     b_gen_returns = filtered_b_gen_rs
     weights = []
-    policy_path = policy_metadatas[pi_b]['policy_path']
-    behavior_policy = D4RL_Policy(policy_path)
-    policy_path = policy_metadatas[pi_e]['policy_path']
-    target_policy = D4RL_Policy(policy_path)
+
+    behavior_policy = policies[pi_b]
+    target_policy = policies[pi_e]
     print("Calculating Weights")
     for i in range (len(b_gen_returns)): # Should only be on the calibration dataset.
         b_o = filtered_b_o_ts[i] # Original env trajectory in match
@@ -354,7 +390,7 @@ if __name__ == '__main__':
         assert len(matched_returns) > 0, "no matched trajectories when calculating weights!"
         all_terms = []
         for t, a, r in zip(matched_trajectories, matched_actions, matched_returns):
-            all_terms.append(calculate_ips_product(t, a, target_policy, behavior_policy) * (np.abs(b_gen_r - r) ** (alpha_r*-1)))
+            all_terms.append(calculate_ips_product(t, a, target_policy, behavior_policy))
         w_hat = np.mean(all_terms) # This is the expectation over the filtered trajectories
         weights += [w_hat]
     print("IPS weights, unnormalized, " + str(weights)) # All nans, because the IPS products are super low?
@@ -364,7 +400,7 @@ if __name__ == '__main__':
 
     new_weighted_errors = []
     for i in range(len(b_o_returns)):
-        new_weighted_errors.append(weights[i] * np.abs(b_o_returns[i] - b_gen_returns[i])) # This should be the absolute value of the difference between returns
+        new_weighted_errors.append(weights[i] * (b_o_returns[i] - b_gen_returns[i])) # This should be the absolute value of the difference between returns
     print("weights ", weights)
     print("new_weighted_errors ", new_weighted_errors)
     print("b_o_returns ", b_o_returns)
@@ -372,12 +408,6 @@ if __name__ == '__main__':
 
 
     true_target_rewards = []
-    d4rl_qlearning = d4rl.qlearning_dataset(env)
-            
-    obs_mean = d4rl_qlearning['observations'].mean(0).astype(np.float32)
-    obs_std = d4rl_qlearning['observations'].std(0).astype(np.float32)
-    rew_mean = d4rl_qlearning['rewards'].mean()
-    rew_std = d4rl_qlearning['rewards'].std()
 
 #    TODO: double check that this is not symmetric?
     print("First Term Approximation: " + str(np.mean(first_term_target_rewards)))

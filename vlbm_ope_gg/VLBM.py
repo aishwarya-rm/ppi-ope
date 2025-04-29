@@ -15,6 +15,14 @@ rnn = tf.contrib.rnn
 tfd = tfp.distributions
 
 
+def seq_length(sequence):
+    used = np.sign(np.max(np.abs(sequence), 2))
+    length = np.sum(used, 1)
+    return np.int32(length)
+
+def seq_length_2d(sequence):
+    return seq_length([sequence])[0]
+
 EPS = 1e-8
 def trun_normal_log_prob(x, mu, std, low, high):
     z = tfd.Normal(0,1).cdf((high-x)/(std+EPS)) - tfd.Normal(0,1).cdf((low-x)/(std+EPS))
@@ -94,25 +102,29 @@ class ReplayBuffer_Trajectory(object):
         """
         self.max_step = max_step
         d4rl_data = [_d for _d in d4rl_data] # convert generator to list
-        
+        print(len(d4rl_data))
+
         d4rl_size = 0
         for i in range(len(d4rl_data)):
-            if d4rl_data[i]['observations'].shape[0] == self.max_step and d4rl_data[i]['next_observations'].shape[0]==self.max_step and  d4rl_data[i]['actions'].shape[0] == self.max_step:
+            if d4rl_data[i]['observations'].shape[0] >= 1 and d4rl_data[i]['next_observations'].shape[0] >= 1 and  d4rl_data[i]['actions'].shape[0] >= 1:
                 d4rl_size += 1
             
         if self.max_size < d4rl_size:
             assert False, "Buffer size smaller than the size of d4rl data, cannot port in"
         
         for i in range(len(d4rl_data)):
-            if d4rl_data[i]['observations'].shape[0] == self.max_step and d4rl_data[i]['next_observations'].shape[0] == self.max_step and d4rl_data[i]['actions'].shape[0] == self.max_step:
-                self.obs1_buf[self.ptr0, :, :] = (d4rl_data[i]['observations'].astype(np.float32) - obs_mean) / obs_std
-                self.obs2_buf[self.ptr0, :, :] = (d4rl_data[i]['next_observations'].astype(np.float32) - obs_mean) / obs_std
-                self.acts_buf[self.ptr0, :, :] = d4rl_data[i]['actions'].astype(np.float32)
-                self.rews_buf[self.ptr0, :] = (d4rl_data[i]['rewards'].astype(np.float32) - rew_mean) / rew_std
-                self.done_buf[self.ptr0, :] = d4rl_data[i]['terminals'].astype(np.float32)
+            if d4rl_data[i]['observations'].shape[0] >= 1 and d4rl_data[i]['next_observations'].shape[0] >= 1 and d4rl_data[i]['actions'].shape[0] >= 1:
+                seq_len = d4rl_data[i]['observations'].shape[0]
+                self.obs1_buf[self.ptr0, :seq_len, :] = (d4rl_data[i]['observations'].astype(np.float32) - obs_mean) / obs_std
+                self.obs2_buf[self.ptr0, :seq_len, :] = (d4rl_data[i]['next_observations'].astype(np.float32) - obs_mean) / obs_std
+                self.acts_buf[self.ptr0, :seq_len, :] = d4rl_data[i]['actions'].astype(np.float32)
+                self.rews_buf[self.ptr0, :seq_len] = (d4rl_data[i]['rewards'].astype(np.float32) - rew_mean) / rew_std
+                self.done_buf[self.ptr0, :seq_len] = d4rl_data[i]['terminals'].astype(np.float32)
                 self.size = min(self.size+1, self.max_size)
                 self.ptr0 = (self.ptr0+1) % self.max_size
                 self.count += 1
+        print("-------------------------------")
+        print(d4rl_size, self.size, self.count)
 
     def add(self, obs, act, rew, done, next_obs):
         self.obs1_buf[self.ptr0, self.ptr1] = obs
@@ -323,10 +335,10 @@ class OPE_Model(object):
             self.decoder_branch_final_state2_sample = self.decoder_branch_final_state2_dist.sample()
             self.decoder_branch_final_state2_log_prob = self.decoder_branch_final_state2_dist.log_prob(self.state2_holder)
         else:
-            self.decoder_branch_final_state_sample = tfd.TruncatedNormal(self.decoder_branch_final_state_mean, self.decoder_branch_final_state_scale, -self.state_bound, self.state_bound).sample()
+            self.decoder_branch_final_state_sample = tfd.TruncatedNormal(self.decoder_branch_final_state_mean, self.decoder_branch_final_state_scale, 0, self.state_bound).sample()
             
-            self.decoder_branch_final_state2_sample = tfd.TruncatedNormal(self.decoder_branch_final_state2_mean, self.decoder_branch_final_state2_scale, -self.state_bound, self.state_bound).sample()
-            self.decoder_branch_final_state2_prob = trun_normal_log_prob(self.state2_holder, self.decoder_branch_final_state2_mean, self.decoder_branch_final_state2_scale, -self.state_bound, self.state_bound)
+            self.decoder_branch_final_state2_sample = tfd.TruncatedNormal(self.decoder_branch_final_state2_mean, self.decoder_branch_final_state2_scale, 0, self.state_bound).sample()
+            self.decoder_branch_final_state2_log_prob = trun_normal_log_prob(self.state2_holder, self.decoder_branch_final_state2_mean, self.decoder_branch_final_state2_scale, 0, self.state_bound)
             
         self.decoder_branch_final_r_dist = tfd.MultivariateNormalDiag(self.decoder_branch_final_r_mean , self.decoder_branch_final_r_scale)
         self.decoder_branch_final_r_sample = self.decoder_branch_final_r_dist.sample()
@@ -507,8 +519,8 @@ class OPE_Model(object):
                     out_sample = out_dist.sample()
                     out_log_prob = out_dist.log_prob(self.state2_holder)
                 else:
-                    out_sample = tfd.TruncatedNormal(loc_state, scale_state, -self.state_bound, self.state_bound).sample()
-                    out_log_prob = trun_normal_log_prob(self.state2_holder, loc_state, scale_state, -self.state_bound, self.state_bound)
+                    out_sample = tfd.TruncatedNormal(loc_state, scale_state, 0, self.state_bound).sample()
+                    out_log_prob = trun_normal_log_prob(self.state2_holder, loc_state, scale_state, 0, self.state_bound)
                 return out_log_prob, out_sample, loc_state, scale_state
             
     # Decoder for rewards          

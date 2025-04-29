@@ -3,15 +3,12 @@ import numpy as np
 from collections import deque
 import random
 import time
-import gym
-from gym import wrappers
 import cloudpickle as cp
 from VLBM import *
 import os
 import tensorflow_probability as tfp
 import multiprocessing as mp
 import os
-import d4rl
 import json
 from functools import partial
 import pandas as pd
@@ -22,7 +19,7 @@ import dill
 import collections
 import concurrent.futures
 from multiprocessing import Manager
-from utils import generate_and_check_trajectory
+# from utils import generate_and_check_trajectory
 
 mp.set_start_method("spawn")
 slim = tf.contrib.slim
@@ -39,7 +36,7 @@ parser.add_argument("-decay_step", type=int, help="Set exponential decay step DE
 parser.add_argument("-decay_rate", type=float, help="Set exponential decay rate DEFAULT=0.997", default=0.997)
 parser.add_argument("-max_iter", type=int, help="Set max number of training iterations DEFAULT=1000", default=1000)
 parser.add_argument("-seed", type=int, help="Set random seed", default=2599)
-parser.add_argument("-gamma", type=float, help="Set discounting factor DEFAULT=0.995", default=0.995)
+parser.add_argument("-gamma", type=float, help="Set discounting factor DEFAULT=0.995", default=0.9)
 parser.add_argument("-batch_size", type=int, help="Set minibatch size DEFAULT=64", default=64)
 parser.add_argument("-num_branch", type=int, help="Set number of branches for VLBM decoder DEFAULT=10", default=10)
 parser.add_argument("-code_size", type=int, help="Set dimension of the latent space DEFAULT=16", default=16)
@@ -49,7 +46,7 @@ parser.add_argument("-val_interval", type=int, help="Validation interval DEFAULT
 # Below are some constants that would not be changed
 parser.add_argument("-path", type=str, help="Path to checkpoint folder")
 parser.add_argument("-repeat", type=int, help="Set action repeat. Since we are training on offline trajectories, so this is not needed (always set to 1)", default=1)
-parser.add_argument("-max_episode_len", type=int, help="Maximum episode length, which is always 1000 for Gym-Mujoco environments", default=1000)
+parser.add_argument("-max_episode_len", type=int, help="Maximum episode length, which is always 1000 for Gym-Mujoco environments", default=20)
 parser.add_argument("-buffer_size", type=int, help="Maximum buffer size. Set to 3000 to make sure it can accomodate all offline trajectories used for training", default=3000)
 
 
@@ -92,6 +89,8 @@ def sequence_dataset(env, dataset=None, **kwargs):
     #     dataset = env.get_dataset(**kwargs)
 
     N = dataset['rewards'].shape[0]
+    print("----------------------")
+    print(N)
     data_ = collections.defaultdict(list)
 
     # The newer version of the dataset adds an explicit
@@ -112,6 +111,7 @@ def sequence_dataset(env, dataset=None, **kwargs):
             if k.find("metadata")==-1:
                 data_[k].append(dataset[k][i])
 
+        episode_step += 1
         if done_bool or final_timestep:
             episode_step = 0
             episode_data = {}
@@ -120,32 +120,67 @@ def sequence_dataset(env, dataset=None, **kwargs):
             yield episode_data
             data_ = collections.defaultdict(list)
 
-        episode_step += 1
 
 
 def evaluate(ope_eval, graph_ope_eval, sess_ope_eval, *args):
+
+    class uniform_policy(object):
+        def __init__(self, a, b):
+            self.a = a
+            self.b = b
+
+        def act(self, s):
+            a = np.random.uniform(self.a, self.b, (1,))
+            return a
+
+    class sS_policy(object):
+        def __init__(self, s, S):
+            self.a = s
+            self.b = S
+
+        def act(self, s):
+            if s < self.a:
+                a = self.b - s
+            else:
+                a = np.random.uniform(0, 0, (1,))
+            return a
     
     # Validate and create checkpoints of VLBM during training
     
     (MAX_EPISODE_LEN, REPEAT, env_state_dim, env_action_dim, RANDOM_SEED, 
     	obs_mean, obs_std, rew_mean, rew_std, rl_params) = args
     
-    with tf.io.gfile.GFile("./d4rl_policies.json", 'r') as f:
-        policy_database = json.load(f)
-
-        policy_metadatas = [i for i in policy_database if i['task.task_names'][0].find(rl_params['env_name'].split("-")[0]+"-")!=-1]
+    # load the dictionary of policy values from the json file
+    with open("./data/inventory_values.json", 'r') as f:
+        truths = dict(json.load(f))
     
-    truths = [np.loadtxt("./truth_discounted/" + p["policy_path"] + ".txt")[0] for p in policy_metadatas]
+    truths_list = [truths['uniform_policy_0_10'], truths['uniform_policy_0_5'], truths['uniform_policy_3_8'], truths['uniform_policy_0_0'], truths['uniform_policy_6_6'],
+            truths['sS_policy_3_10'], truths['sS_policy_3_6'], truths['sS_policy_7_10'], truths['sS_policy_1_5'], truths['sS_policy_5_8']]
     
     pred = []
 
     learned_env = LearnedEnv(ope_eval)
 
-    for _i in range(len(policy_metadatas)):
+    pi_u_0_10 = uniform_policy(0, 10)
+    pi_u_0_5 = uniform_policy(0, 5)
+    pi_u_3_8 = uniform_policy(3, 8)
+    pi_u_0_0 = uniform_policy(0, 0)
+    pi_u_6_6 = uniform_policy(6, 6)
+
+    pi_sS_3_10 = sS_policy(3, 10)
+    pi_sS_3_6 = sS_policy(3, 6)
+    pi_sS_7_10 = sS_policy(7, 10)
+    pi_sS_1_5 = sS_policy(1, 5)
+    pi_sS_5_8 = sS_policy(5, 8)
+
+    policies = [pi_u_0_10, pi_u_0_5, pi_u_3_8, pi_u_0_0, pi_u_6_6,
+            pi_sS_3_10, pi_sS_3_6, pi_sS_7_10, pi_sS_1_5, pi_sS_5_8]
+
+    for _i in range(len(policies)):
         with graph_ope_eval.as_default():
             ope_eval.saver.restore(sess_ope_eval, ope_eval.save_appendix)
         ep_rewards = []
-        policy = D4RL_Policy(policy_metadatas[_i]['policy_path'])
+        policy = policies[_i]
         for i in range(5):
 
             terminal = 0
@@ -157,7 +192,7 @@ def evaluate(ope_eval, graph_ope_eval, sess_ope_eval, *args):
             for j in range(MAX_EPISODE_LEN):
 
                 if j % REPEAT == 0:
-                    a, _, _ = policy.act(np.reshape(s, (env_state_dim,)), np.zeros((env_action_dim,)))
+                    a = policy.act(np.reshape(s, (env_state_dim,)))
                 s2, r, terminal, info = learned_env.step(a)
                 r = r*rew_std + rew_mean
                 s2 = s2.reshape(env_state_dim)*obs_std + obs_mean
@@ -171,7 +206,7 @@ def evaluate(ope_eval, graph_ope_eval, sess_ope_eval, *args):
                     break
                     
         pred += [np.mean(ep_rewards)]
-    return np.mean(np.abs(np.asarray(truths)-np.asarray(pred)))
+    return np.mean(np.abs(np.asarray(truths_list)-np.asarray(pred)))
 
 # def generate_trajectory(policy, env):
 #     s = env.reset()
@@ -206,6 +241,7 @@ def calculate_ips_product(t_t, t_a, target_policy, behavior_policy):
             ips_vals.append(ips_weight)
     return np.sum(ips_vals)
 
+'''
 def calculate_policy_value(target_policy_path, behavior_policy_path, ope_model, n_tries=100):
     # Returns a list of trajectories that are calibrated for this particular behavior and target policy
     ope_path = args.path
@@ -322,7 +358,7 @@ def calculate_policy_value(target_policy_path, behavior_policy_path, ope_model, 
         for i in range(len(predicted_returns)):
             errors.append(actual_returns[i] - predicted_returns[i])
         return (np.mean(first_term_target_rewards) - np.quantile(errors, 1 - alpha), (np.mean(first_term_target_rewards) - np.quantile(errors, alpha))), np.mean(true_target_rewards)
-
+'''
 
 # train VAE to learn the dynamic of inventory control problem
 # s: inventory level, a: order quantity, r: reward, o: demand
@@ -343,12 +379,14 @@ class Inventory_Simulator(object):
         self.H = H
 
     def reset(self): # return the initial state
-        return np.random.randint(0, self.N + 1)
+        return np.random.uniform(0, self.N, (1,))
 
     def step(self, s, a, h): # transition function
-        o = np.random.poisson(self.lambda_)
-        s1 = max(0, min(self.N, s + a) - o)
-        r = -self.k * int(a > 0) - self.c * (min(self.N, s + a) - s) - self.z * s + self.p * o
+        o = np.random.normal(5, 1, (1,)) # demand
+        s1 = np.clip(np.clip(s + a, a_min=None, a_max=self.N) - o, 0, None)
+        # s1 = np.array(s1)
+        r = -self.k * int(a > 0) - self.c * (min(self.N, s + a) - s) - self.z * s + self.p * min(o, s + a)
+        r = float(r)
         done = (h == self.H - 1)
         return s, a, r, s1, done
 
@@ -379,7 +417,7 @@ if __name__ == '__main__':
     MAX_EPISODE_LEN = args.max_episode_len
     REPEAT = args.repeat # Action repeat is not needed since we are training on offline trajectories. So it's always set to 1.
     BUFFER_SIZE_OPE = args.buffer_size
-    BEST_MAE = 9999. # Used later for validation and checkpoint saving
+    BEST_MAE = 20. # Used later for validation and checkpoint saving
 
     ENV = "inventory"
 
@@ -409,7 +447,7 @@ if __name__ == '__main__':
     tf.set_random_seed(RANDOM_SEED)
     # env.seed(RANDOM_SEED)
 
-    env = Inventory_Simulator(10, 1, 2, 2, 4, 10, 20)
+    env = Inventory_Simulator(N=10, k=1, c=2, z=2, p=4, lambda_=5, H=20)
     env_state_dim = 1
     env_action_dim = 1
     env_action_bound = 10
@@ -417,23 +455,24 @@ if __name__ == '__main__':
     if TRAIN:
         iters_already_passed = 0
 
-        # To determine if there exist checkpoints associated with same hyper-parameters
-        if os.path.exists("./rl_stats/" + file_appendix + ".txt"):
-            stats_df = pd.read_csv("./rl_stats/" + file_appendix + ".txt", header=None, delimiter=" | ")
-            iters_already_passed = len(stats_df.index.values)
-            assert iters_already_passed < MAX_ITER, 'There already exist a model trained using same parameter, please delete its checkpoint and logs before starting a new round of training'
+        # #To determine if there exist checkpoints associated with same hyper-parameters
+        # if os.path.exists("./rl_stats/" + file_appendix + ".txt"):
+        #     stats_df = pd.read_csv("./rl_stats/" + file_appendix + ".txt", header=None, delimiter=" | ")
+        #     iters_already_passed = len(stats_df.index.values)
+        #     assert iters_already_passed < MAX_ITER, 'There already exist a model trained using same parameter, please delete its checkpoint and logs before starting a new round of training'
 
         graph_ope_models_eval = tf.Graph()
         with tf.Session(config=config, graph=graph_ope_models) as sess_ope_models:
             with tf.Session(config=config, graph=graph_ope_models_eval) as sess_ope_models_eval:
 
-                inventory_data = np.load("./inventory_data.npz") # TODO: assume we have inventory data, this should be generated by the simulator
+                inventory_data = dict(np.load("data/inventory_data.npz", allow_pickle=True))
+                print(inventory_data.keys())
 
-                obs_mean = inventory_data['observations'].mean(0).astype(np.float32)
-                obs_std = inventory_data['observations'].std(0).astype(np.float32)
+                obs_mean = np.mean(inventory_data['observations'])
+                obs_std = np.std(inventory_data['observations'])
 
-                rew_mean = inventory_data['rewards'].mean()
-                rew_std = inventory_data['rewards'].std()
+                rew_mean = np.mean(inventory_data['rewards'])
+                rew_std = np.std(inventory_data['rewards'])
 
                 with graph_ope_models.as_default():
 
@@ -522,6 +561,7 @@ if __name__ == '__main__':
 
                             # Save model checkpoints
                             if mae < BEST_MAE:
+                                print("Best MAE: " + str(mae))
                                 ope_model.saver.save(
                                     ope_model.sess,
                                     ope_model.save_appendix.replace("ope.ckpt", "ope_best.ckpt")
@@ -549,7 +589,7 @@ if __name__ == '__main__':
     else:
         with tf.io.gfile.GFile("./d4rl_policies.json", 'r') as f:
             policy_database = json.load(f)
-
+        '''
         d4rl_qlearning = d4rl.qlearning_dataset(env)
         ope_path = args.path
         obs_mean = d4rl_qlearning['observations'].mean(0).astype(np.float32)
@@ -609,7 +649,7 @@ if __name__ == '__main__':
                 # TODO: parallelization
                 # TODO: use walker-2d
                 import ipdb; ipdb.set_trace()
-
+        '''
 
 
 

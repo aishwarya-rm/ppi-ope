@@ -19,27 +19,40 @@ from tensorflow.python.util import nest
 # from train_vlbm import generate_trajectory
 import random
 import numpy as np
-import gym
-import d4rl
 
-def generate_trajectory(policy, MAX_EPISODE_LEN=3, GAMMA=0.995, REPEAT=1): # From original environment
+class Inventory_Simulator(object):
+    def __init__(self, N, k, c, z, p, lambda_, H):
+        self.N = N
+        self.k = k
+        self.c = c
+        self.z = z
+        self.p = p
+        self.lambda_ = lambda_
+        self.H = H
 
-    env = gym.make("halfcheetah-medium-expert-v2")
+    def reset(self): # return the initial state
+        return np.random.uniform(0, self.N, (1,))
 
-    env_state_dim = env.observation_space.shape[0]
-    env_action_dim = env.action_space.shape[0]
-    d4rl_qlearning = d4rl.qlearning_dataset(env)
+    def step(self, s, a, h): # transition function
+        o = np.random.normal(5, 1, (1,)) # demand
+        s1 = np.clip(np.clip(s + a, a_min=None, a_max=self.N) - o, 0, None)
+        # s1 = np.array(s1)
+        r = -self.k * int(a > 0) - self.c * (min(self.N, s + a) - s) - self.z * s + self.p * min(o, s + a)
+        r = float(r)
+        done = (h == self.H - 1)
+        return s, a, r, s1, done
+    
 
-    obs_mean = d4rl_qlearning['observations'].mean(0).astype(np.float32)
-    obs_std = d4rl_qlearning['observations'].std(0).astype(np.float32)
-    rew_mean = d4rl_qlearning['rewards'].mean()
-    rew_std = d4rl_qlearning['rewards'].std()
-
+def generate_trajectory(policy, MAX_EPISODE_LEN=20, GAMMA=0.995, REPEAT=1): # From original environment
+    env = Inventory_Simulator(N=10, k=1, c=2, z=2, p=4, lambda_=5, H=20)
+    env_state_dim = 1
+    env_action_dim = 1
+    
     s = env.reset()
-    s = s.reshape(env_state_dim) * obs_std + obs_mean
+    s = np.array(s).reshape(env_state_dim,) #* obs_std + obs_mean
     ep_reward = 0
     epsilon = 0.1
-    trajectory = [s]
+    trajectory = []
     trajectory_actions = []
     terminal = 0
     for j in range(MAX_EPISODE_LEN):
@@ -47,52 +60,51 @@ def generate_trajectory(policy, MAX_EPISODE_LEN=3, GAMMA=0.995, REPEAT=1): # Fro
             # if np.random.rand() < epsilon:
             #     a = env.action_space.sample()  # random action
             # else:
-            a, _, _ = policy.act(np.reshape(s, (env_state_dim,)), np.zeros((env_action_dim,))) # Avoiding randomness
+            a = policy.act(np.reshape(s, (env_state_dim,))) # Avoiding randomness
         trajectory_actions.append(a)
-        s2, r, terminal, info = env.step(a)
-        r = r * rew_std + rew_mean
-        s2 = s2.reshape(env_state_dim) * obs_std + obs_mean
+        _, _, r, s2, terminal, = env.step(s, a, j)
+        r = r #* rew_std + rew_mean
+        s2 = s2.reshape(env_state_dim) #* obs_std + obs_mean
 
         ep_reward += r * (GAMMA ** j)
-
-        s = s2
         trajectory.append(s)
+        s = s2
 
         if terminal or j == MAX_EPISODE_LEN - 1:
             return ep_reward, trajectory, trajectory_actions
 
-def generate_and_check_trajectory(policies_and_envs, epsilon):
-    """Generate trajectories and check the conditions in parallel."""
-    target_policy, learned_env, behavior_policy, original_env = policies_and_envs
-    env = gym.make('halfcheetah-medium-expert-v2')
-    env_action_dim = env.action_space.shape[0]
-    class LearnedEnv(object):
-        def __init__(self, model):
-            self.model = model
+# def generate_and_check_trajectory(policies_and_envs, epsilon):
+#     """Generate trajectories and check the conditions in parallel."""
+#     target_policy, learned_env, behavior_policy, original_env = policies_and_envs
+#     env = gym.make('halfcheetah-medium-expert-v2')
+#     env_action_dim = env.action_space.shape[0]
+#     class LearnedEnv(object):
+#         def __init__(self, model):
+#             self.model = model
 
-        def reset(self):
-            s0 = self.model.init_z0_s0()
+#         def reset(self):
+#             s0 = self.model.init_z0_s0()
 
-            self.obs = s0
-            return s0
+#             self.obs = s0
+#             return s0
 
-        def step(self, u):
-            new_obs, reward = self.model.get_zt1_s2_r(np.reshape(u, (1, env_action_dim)))
-            self.obs = new_obs
-            self.model.update_zt()
-            return new_obs, reward, False, {}
+#         def step(self, u):
+#             new_obs, reward = self.model.get_zt1_s2_r(np.reshape(u, (1, env_action_dim)))
+#             self.obs = new_obs
+#             self.model.update_zt()
+#             return new_obs, reward, False, {}
 
 
-    b_r, b_t, b_a = generate_trajectory(behavior_policy, original_env)
-    t_r, t_t, t_a = generate_trajectory(target_policy, learned_env)
-#### key component
-    if (np.linalg.norm(t_t[0][:8] - b_t[0][:8]) < epsilon):
-        if (np.linalg.norm(t_t[-1][:8] - b_t[-1][:8]) < epsilon):
-            obj = {'tr':t_r, 't_t':t_t, 't_a':t_a, 'b_r':b_r, 'b_t':b_t, 'b_a':b_a}
-            rand_int = np.random.choice(10000)
-            pickle.dump(obj, open("calibration_dataset/" + str(rand_int) + ".pkl", 'wb'))
-            return (t_r, t_t, t_a), (b_r, b_t, b_a)
-    return (0, [], []), (0, [], [])
+#     b_r, b_t, b_a = generate_trajectory(behavior_policy, original_env)
+#     t_r, t_t, t_a = generate_trajectory(target_policy, learned_env)
+# #### key component
+#     if (np.linalg.norm(t_t[0][:8] - b_t[0][:8]) < epsilon):
+#         if (np.linalg.norm(t_t[-1][:8] - b_t[-1][:8]) < epsilon):
+#             obj = {'tr':t_r, 't_t':t_t, 't_a':t_a, 'b_r':b_r, 'b_t':b_t, 'b_a':b_a}
+#             rand_int = np.random.choice(10000)
+#             pickle.dump(obj, open("calibration_dataset/" + str(rand_int) + ".pkl", 'wb'))
+#             return (t_r, t_t, t_a), (b_r, b_t, b_a)
+#     return (0, [], []), (0, [], [])
 
 def my_static_rnn(cell,
                inputs,
