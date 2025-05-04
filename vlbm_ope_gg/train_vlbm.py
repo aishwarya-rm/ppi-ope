@@ -228,13 +228,13 @@ def calculate_policy_value(target_policy_path, behavior_policy_path, ope_model, 
     # Calculate the true value of the policy
     true_target_rewards = []
     for _, i in enumerate(tqdm.tqdm(range(n_tries))):
-        target_reward, _, _ = generate_trajectory(target_policy, original_env)
+        target_reward, _, _ = rollout_original_env(target_policy, original_env)
         true_target_rewards.append(target_reward)
 
     # Generate a set of trajectories for the first term from target policy
     first_term_target_rewards = []
     for _, i in enumerate(tqdm.tqdm(range(n_tries))):  # TODO: Make this 100000
-        ep_reward, _, _ = generate_trajectory(target_policy, learned_env)
+        ep_reward, _, _ = rollout_original_env(target_policy, learned_env)
         first_term_target_rewards.append(ep_reward)
 
     # Generate possible matching trajectories (this is without paralellization)

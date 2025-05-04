@@ -259,7 +259,7 @@ if __name__ == '__main__':
     mean_ppi = first_term + np.nanmean(second_term_all)
     print("DR-PPI: pi_b=" + str(pi_b) + " pi_e=" + str(pi_e) + " Interval: (" + str(mean_ppi - z * np.sqrt(var_ppi)) + ", " + str(mean_ppi + z * np.sqrt(var_ppi)) + ")")
 
-    # CP-PPI --> there are no matching trajectories :(
+    # CP-PPI
     weights = []
     first_term = np.mean(t_rs)
     behavior_trajectories_matching_cp_ppi = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_matching_cp_ppi.pkl", 'rb'))
@@ -270,6 +270,11 @@ if __name__ == '__main__':
             continue
         else:
             matched_trajs = behavior_trajectories_matching_cp_ppi[i]
+
+            # All possible pairs of matching trajectories
+            matching_pairs = [(i, j) for j in range(len(matched_trajs['ep_returns']))] # This is all pairs of trajectories in the inner summation
+            
+
             expectation_over_matched_trajs = []
             for j in range(len(matched_trajs['ep_returns'])):
                 traj = matched_trajs['states'][j]

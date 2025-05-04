@@ -536,14 +536,22 @@ class OPE_Model(object):
                 out_sample = out_dist.sample()
                 return out_dist, out_sample, loc_r, scale_r
             
-    def init_z0_s0(self):
-        self.zt = self.sess.run(self.decoder_prior_sample)
-        self.zt = np.stack([self.zt[0] for _ in range(self.branch_size)]).reshape(self.branch_size,1,self.code_size)
-#         self.zt = self.zt[0].reshape(1,-1)
-        s0 = self.sess.run(self.decoder_branch_final_state_sample, feed_dict={self.decoder_zt_holder : self.zt})
+    def init_z0_s0(self, start_state=None):
+        if start_state is None:
+            self.zt = self.sess.run(self.decoder_prior_sample)
+            self.zt = np.stack([self.zt[0] for _ in range(self.branch_size)]).reshape(self.branch_size,1,self.code_size)
+    #         self.zt = self.zt[0].reshape(1,-1)
+            s0 = self.sess.run(self.decoder_branch_final_state_sample, feed_dict={self.decoder_zt_holder : self.zt})
+            s0 = s0[0]
+        else:
+            s0 = np.array(start_state).reshape(1, -1)
+            self.zt = self.sess.run(self.decoder_prior_sample) # Decoder is still in some random state.
+            self.zt = np.stack([self.zt[0] for _ in range(self.branch_size)]).reshape(self.branch_size, 1,
+                                                                                      self.code_size)
+
         self.encoder_lstm = np.zeros((1, self.num_hidden*2)).astype(np.float32)
         self.decoder_lstm = np.zeros((self.branch_size, 1, self.num_hidden*2)).astype(np.float32)
-        return s0[0]
+        return s0
     
     def get_zt1_s2_r(self, action):
         self.zt1, self.decoder_lstm, s2, r = self.sess.run(
@@ -658,6 +666,7 @@ class D4RL_Policy:
         self.fclast_b_logstd = weights['last_fc_log_std/bias']
         self.nonlinearity = self.get_nonlinearity(weights['nonlinearity'])
         self.output_transformation = self.get_output_transformation(weights['output_distribution'])
+        # self.action_dist = SquashedDiagGaussianDistribution(6) # For half cheetah
 
     def get_nonlinearity(self, nonlinearity_type):
         if nonlinearity_type == 'tanh':
@@ -684,21 +693,38 @@ class D4RL_Policy:
         x = np.dot(self.fc1_w, x) + self.fc1_b
         x = self.nonlinearity(x)
         mean = np.dot(self.fclast_w, x) + self.fclast_b
-        logstd = np.dot(self.fclast_w_logstd, x) + self.fclast_b_logstd
+        log_std = np.dot(self.fclast_w_logstd, x) + self.fclast_b_logstd
 
-        std = np.exp(logstd)
         # print("policy mean ", mean)
         # print("policy std ", std)
-        action = self.output_transformation(mean + np.exp(logstd) * noise)
-        return action, mean, std
-    def propensity_score(self, state, action):
-        _, mean, std = self.act(state)
-        # apply one more tanh after norm
-        prob_density = np.tanh(norm.pdf(action, loc=mean, scale=std))
-        # prob_density = norm.pdf(action, loc=mean, scale=std) # need double check if it is correct
-        return np.prod(prob_density)
-        # return np.max(np.prod(prob_density) + np.random.normal(loc=0, scale=0.2), 0)# Multiply over dimensions for multi-dimensional actions
+        action = self.output_transformation(mean + np.exp(log_std) * noise)
+        return action, mean, log_std
 
+    def inverse_tanh(self, x):
+        # Clipping to avoid numerical issues
+        return 0.5 * np.log((1 + np.clip(x, -0.999, 0.999)) / (1 - np.clip(x, -0.999, 0.999)))
+    def log_prob(self, state, action):
+        _, mean, log_std = self.act(state, noise=0.0)
+        std = np.exp(np.clip(log_std, -20, 2))
+
+        # Unsquash action
+        pre_tanh_action = self.inverse_tanh(action)
+
+        # Log PDF of Gaussian
+        log_prob = norm.logpdf(pre_tanh_action, loc=mean, scale=std)
+        log_prob = np.sum(log_prob)
+
+        # Tanh correction (Jacobian of inverse)
+        correction = np.sum(np.log(1 - np.tanh(pre_tanh_action) ** 2 + 1e-6))
+        return log_prob - correction
+    # def propensity_score(self, state, action):
+    #     _, mean, log_std = self.act(state)
+    #     # apply one more tanh after norm
+    #     prob_density = np.tanh(norm.pdf(action, loc=mean, scale=np.exp(log_std)))
+    #     prob_density = norm.pdf(action, loc=mean, scale=np.exp(log_std)) # need double check if it is correct
+    #     # return self.action_dist.log_prob_from_params(mean, log_std)
+    #     return np.prod(prob_density)
+    #     # return np.max(np.prod(prob_density) + np.random.normal(loc=0, scale=0.2), 0)# Multiply over dimensions for multi-dimensional actions
 
 
 
