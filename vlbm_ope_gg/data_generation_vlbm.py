@@ -39,7 +39,7 @@ parser.add_argument("-repeat", type=int,
 parser.add_argument("-max_episode_len", type=int,
                     help="Maximum episode length, which is always 1000 for Gym-Mujoco environments", default=100)
 
-def rollout_original_env(policy): # From original environment
+def rollout_original_env(policy, starting_state=None, scale=None): # From original environment
 
     env = gym.make("halfcheetah-medium-expert-v2")
 
@@ -51,8 +51,21 @@ def rollout_original_env(policy): # From original environment
     obs_std = d4rl_qlearning['observations'].std(0).astype(np.float32)
     rew_mean = d4rl_qlearning['rewards'].mean()
     rew_std = d4rl_qlearning['rewards'].std()
+    if starting_state is not None:
+        nq = env.model.nq  # Number of position variables (qpos)
+        nv = env.model.nv  # Number of velocity variables (qvel)
+        _ = env.reset()
+        if scale is not None:
+            qpos = np.concatenate([[0.0], starting_state[:nq - 1]]) + scale * np.concatenate([[0.0], obs_mean[:nq-1]])
+            qvel = starting_state[nq - 1:] + scale * obs_mean[nq-1:]
+        else:
+            qpos = np.concatenate([[0.0], starting_state[:nq - 1]])
+            qvel = starting_state[nq - 1:]
 
-    s = env.reset()
+        env.set_state(qpos, qvel)
+        s = env.unwrapped._get_obs()
+    else:
+        s = env.reset()
     s = s.reshape(env_state_dim) * obs_std + obs_mean
     ep_reward = 0
     trajectory_states = [s]
@@ -171,6 +184,7 @@ def rollout_learned_env(policy, starting_state=None, scale=None):
                     return ep_reward, trajectory_states, trajectory_actions, trajectory_rewards
 
 if __name__ == '__main__':
+    # TODO condition everything on some initial state (not currently doing this)
     args = parser.parse_args()
     if not args.no_gpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_idx)
@@ -191,7 +205,7 @@ if __name__ == '__main__':
     m = 20
     pi_e = 10
     pi_b = 9
-    epsilon_r = 3
+    epsilon_r = 80
     num_processes = np.min([n, 30])
 
     ENV = args.env
@@ -221,41 +235,92 @@ if __name__ == '__main__':
     target_policy = D4RL_Policy(policy_metadatas[pi_e]['policy_path'])
     behavior_policy = D4RL_Policy(policy_metadatas[pi_b]['policy_path'])
 
-    # Generate Trajectories Using the Learned Environment For Target Policy (first term)
-    print("******Generating Trajectories: Target Policy, Learned Dynamics*****")
+    # # Generate Trajectories Using the Learned Environment For Target Policy (first term)
+    # Used for discriminator.
+    # print("******Generating Trajectories: Target Policy, Learned Dynamics*****")
+    # pool = mp.Pool(num_processes)
+    # res = pool.map(rollout_learned_env, [target_policy for _ in range(n)])
+    # t_ep_rewards, t_states, t_actions, t_rewards = zip(*res)
+    # first_term_trajs = {'ep_returns': t_ep_rewards, 'states': t_states, 'actions': t_actions, 'rewards':t_rewards}
+    # pickle.dump(first_term_trajs, open('./saved_trajectories/' + str(pi_e) + "_target_trajectories.pkl", 'wb'))
+    # pool.close()
+    # pool.join()
+    #
+    # # Generate the offline behavior dataset
+    # Used for discriminator
+    # print("*****Generating Trajectories: Behavior Policy, Original Dynamics****")
+    # pool = mp.Pool(num_processes)
+    # res = pool.map(rollout_original_env, [behavior_policy for _ in range(n)])
+    # b_ep_rewards, b_states, b_actions, b_rewards = zip(*res)
+    # pool.close()
+    # pool.join()
+    # behavior_trajectories_o = {'ep_returns': b_ep_rewards, 'states': b_states, 'actions': b_actions, 'rewards':b_rewards}
+    # pickle.dump(behavior_trajectories_o, open('./saved_trajectories/' + str(pi_b) + "_offline_dataset.pkl", 'wb'))
+    #
+    # # Generate the true value of the policy (using MCMC sampling)
+    # Used for discriminator
+    # print("*****Generating Trajectories: Target Policy, Original Dynamics****")
+    # pool = mp.Pool(num_processes)
+    # res = pool.map(rollout_original_env, [target_policy for _ in range(n)])
+    # t_ep_rewards, t_states, t_actions, t_rewards = zip(*res)
+    # pool.close()
+    # pool.join()
+    # target_trajectories_o = {'ep_returns': b_ep_rewards, 'states': b_states, 'actions': b_actions,
+    #                            'rewards': b_rewards}
+    # pickle.dump(target_trajectories_o, open('./saved_trajectories/' + str(pi_e) + "_target_dataset.pkl", 'wb'))
+    #
+    #
+
+    # State conditioned generations
+    behavior_trajectories_o = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_offline_dataset.pkl", 'rb'))
+    b_states = behavior_trajectories_o['states']  # This is just an arbitrary first state
+    s_0 = b_states[0][0]
+
+    # Generate trajectories using the Learned Environment For Target Policy (first term) conditioned on state
+    # Used for DR PPI and CP PPI
+    print("*****Generating Trajectories: Target Policy, Learned Env******")
     pool = mp.Pool(num_processes)
-    res = pool.map(rollout_learned_env, [target_policy for _ in range(n)])
-    t_ep_rewards, t_states, t_actions, t_rewards = zip(*res)
-    first_term_trajs = {'ep_returns': t_ep_rewards, 'states': t_states, 'actions': t_actions, 'rewards':t_rewards}
-    pickle.dump(first_term_trajs, open('./saved_trajectories/' + str(pi_e) + "_target_trajectories.pkl", 'wb'))
+    scales = [np.random.normal(loc=0, scale=0.2) for _ in range(n)]
+    res = pool.starmap(rollout_learned_env, [(target_policy, s_0, scales[ll]) for ll in range(n)])
+    gen_returns, gen_states, gen_actions, gen_rewards = zip(*res)
+    first_term_trajs_s0 = {'ep_returns': gen_returns, 'states': gen_states, 'actions': gen_actions, 'rewards': gen_rewards}
+    pickle.dump(first_term_trajs_s0, open('./saved_trajectories/' + str(pi_e) + "_target_trajectories_s0.pkl", 'wb'))
     pool.close()
     pool.join()
 
-    # Generate the offline behavior dataset
-    print("*****Generating Trajectories: Behavior Policy, Original Dynamics****")
+    # Generate trajectories using the original environment for the target policy conditioned on state
+    # Used for DR PPI and CP PPI
+    print("*****Generating Trajectories: Target Policy, MCMC******")
     pool = mp.Pool(num_processes)
-    res = pool.map(rollout_original_env, [behavior_policy for _ in range(n)])
-    b_ep_rewards, b_states, b_actions, b_rewards = zip(*res)
+    res = pool.starmap(rollout_original_env, [(target_policy, s_0) for ll in range(n)])
+    gen_returns, gen_states, gen_actions, gen_rewards = zip(*res)
+    target_trajs_s0 = {'ep_returns': gen_returns, 'states': gen_states, 'actions': gen_actions,
+                           'rewards': gen_rewards}
+    pickle.dump(target_trajs_s0, open('./saved_trajectories/' + str(pi_e) + "_target_dataset_s0.pkl", 'wb'))
     pool.close()
     pool.join()
-    behavior_trajectories_o = {'ep_returns': b_ep_rewards, 'states': b_states, 'actions': b_actions, 'rewards':b_rewards}
-    pickle.dump(behavior_trajectories_o, open('./saved_trajectories/' + str(pi_b) + "_offline_dataset.pkl", 'wb'))
 
-    # Generate the true value of the policy (using MCMC sampling)
-    print("*****Generating Trajectories: Target Policy, Original Dynamics****")
+    # Generate trajectories using the behavior policy as the real offline dataset
+    # Used for DR PPI and CP PPI
+    print("*****Generating Trajectories: Behavior Policy, Offline******")
     pool = mp.Pool(num_processes)
-    res = pool.map(rollout_original_env, [target_policy for _ in range(n)])
-    t_ep_rewards, t_states, t_actions, t_rewards = zip(*res)
+    scales = [np.random.normal(loc=0, scale=0.2) for _ in range(n)]
+    res = pool.starmap(rollout_original_env, [(behavior_policy, s_0, scales[ll]) for ll in range(n)])
+    gen_returns, gen_states, gen_actions, gen_rewards = zip(*res)
+    behavior_trajs_s0 = {'ep_returns': gen_returns, 'states': gen_states, 'actions': gen_actions,
+                       'rewards': gen_rewards}
+    pickle.dump(behavior_trajs_s0, open('./saved_trajectories/' + str(pi_b) + "_offline_dataset_s0.pkl", 'wb'))
     pool.close()
     pool.join()
-    target_trajectories_o = {'ep_returns': b_ep_rewards, 'states': b_states, 'actions': b_actions,
-                               'rewards': b_rewards}
-    pickle.dump(target_trajectories_o, open('./saved_trajectories/' + str(pi_e) + "_target_dataset.pkl", 'wb'))
-
-
 
     # Generate trajectories that match in the first state for all trajectories in the behavior dataset (DR-PPI)
     print("*****Generating Trajectories: Behavior Policy, Matching for DR-PPI******")
+    behavior_trajectories_s0 = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_offline_dataset_s0.pkl", 'rb'))
+
+    b_ep_rewards = behavior_trajectories_o['ep_returns']
+    b_states = behavior_trajectories_s0['states']
+    b_o_as = behavior_trajectories_s0['actions']
+    b_o_tr = behavior_trajectories_s0['rewards']
     behavior_trajectories_matching_dr_ppi = {}
     for i, b_traj_states in enumerate(b_states):
         s_0 = b_traj_states[0]  # This is the first state in the trajectory
@@ -282,7 +347,7 @@ if __name__ == '__main__':
         s_0 = b_traj_states[0]  # This is the first state in the behavior trajectory
         b_traj_return = b_ep_rewards[i] # Return of the behavior trajectory
         pool = mp.Pool(num_processes)
-        scales = [np.random.normal(loc=0, scale=0.2) for _ in range(m)]  # To add some noise
+        scales = [np.random.normal(loc=0, scale=1) for _ in range(m)]  # To add some noise
         res = pool.starmap(rollout_learned_env, [(behavior_policy, s_0, scales[ll]) for ll in range(m)])
         gen_returns, gen_states, gen_actions, gen_rewards = zip(*res)
         pool.close()

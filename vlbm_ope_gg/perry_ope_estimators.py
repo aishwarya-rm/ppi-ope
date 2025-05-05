@@ -174,7 +174,7 @@ def train_discriminator(behavior_trajectories, target_trajectories):
     val_label_pi_b = torch.Tensor(np.zeros(val_pi_b.shape[0]))
 
     # Training Loop
-    for epoch in range(10000):
+    for epoch in range(1000):
         preds = model(torch.cat([inputs_pi_e, inputs_pi_b])).squeeze(-1)
         loss = criterion(preds, torch.cat([labels_pi_e, labels_pi_b]))
         optimizer.zero_grad()
@@ -224,16 +224,12 @@ if __name__ == '__main__':
     target_policy = D4RL_Policy(policy_metadatas[pi_e]['policy_path'])
     behavior_policy = D4RL_Policy(policy_metadatas[pi_b]['policy_path'])
 
-    # Trajectories from the target policy, learned dynamics
-    first_term_trajs = pickle.load(open('./saved_trajectories/' + str(pi_e) + "_target_trajectories.pkl", 'rb'))
-    # Trajectories from the behavior policy, original dynamics (offline behavior dataset)
-    behavior_trajectories_o = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_offline_dataset.pkl", 'rb'))
+    first_term_trajs = pickle.load(open('./saved_trajectories/' + str(pi_e) + "_target_trajectories.pkl", 'rb')) # target policy, learned dynamics
+    behavior_trajectories_o = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_offline_dataset.pkl", 'rb')) #behavior policy, original env
+    target_trajectories_o = pickle.load(open('./saved_trajectories/' + str(pi_e) + "_target_dataset.pkl", 'rb')) # target policy, original env
+    print("v(pi_e) full policy = " + str(np.mean(target_trajectories_o['ep_returns'])))
 
-    # True Target policy value = 20.69
-    target_trajectories_o = pickle.load(open('./saved_trajectories/' + str(pi_e) + "_target_dataset.pkl", 'rb'))
-    print("v(pi_e) = " + str(np.mean(target_trajectories_o['ep_returns'])))
-
-    # Discriminator approach (H=1000, very little data though)
+    # Discriminator approach
     b_o_rs = behavior_trajectories_o['ep_returns']
     b_o_ts = behavior_trajectories_o['states']
     b_o_as = behavior_trajectories_o['actions']
@@ -256,19 +252,30 @@ if __name__ == '__main__':
     print("Discriminator: pi_b=" + str(pi_b) + " pi_e=" + str(pi_e) + " Interval: (" + str(quantiles[0]) + ", " + str(
         quantiles[1]) + ")")
 
+    # True value of the state
+    target_trajectories_s0 = pickle.load(open('./saved_trajectories/' + str(pi_e) + "_target_dataset_s0.pkl", 'rb'))
+    print("v_pie(s_0) = " + str(np.mean(target_trajectories_s0['ep_returns'])))
+
+    first_term_trajs_s0 = pickle.load(open('./saved_trajectories/' + str(pi_e) + "_target_trajectories_s0.pkl", 'rb'))
+    behavior_trajectories_s0 = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_offline_dataset_s0.pkl", 'rb'))
+    t_rs = first_term_trajs_s0['ep_returns']
+    b_o_rs_s0 = behavior_trajectories_s0['ep_returns']
+    b_o_ts_s0 = behavior_trajectories_s0['states']
+    b_o_as_s0 = behavior_trajectories_s0['actions']
+    b_o_tr_s0 = behavior_trajectories_s0['rewards']
+
     # DR-PPI
-    t_rs = first_term_trajs['ep_returns']
     first_term = np.mean(t_rs)  # Calculating the first term (expectation over target rewards)
     var_f = np.std(t_rs) ** 2
     behavior_trajectories_matching_dr_ppi = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_matching_dr_ppi.pkl", 'rb'))
     second_term_all = []
-    for i in range(len(b_o_rs)):  # For each behavior trajectory
-        behavior_trajectory = b_o_ts[i]
-        behavior_actions = b_o_as[i]
-        behavior_rewards = b_o_tr[i]
+    for i in range(len(b_o_rs_s0)):  # For each behavior trajectory
+        behavior_trajectory = b_o_ts_s0[i]
+        behavior_actions = b_o_as_s0[i]
+        behavior_rewards = b_o_tr_s0[i]
         m_term = np.mean(behavior_trajectories_matching_dr_ppi[i]['ep_returns'])
         rho = calculate_ips_product(behavior_trajectory, behavior_actions, behavior_rewards, target_policy, behavior_policy)
-        behavior_return = b_o_rs[i]
+        behavior_return = b_o_rs_s0[i]
         second_term_all.append(rho * behavior_return - m_term)
 
     var_b = np.nanstd(second_term_all) ** 2
@@ -283,7 +290,7 @@ if __name__ == '__main__':
     first_term = np.mean(t_rs)
     behavior_trajectories_matching_cp_ppi = pickle.load(open('./saved_trajectories/' + str(pi_b) + "_matching_cp_ppi.pkl", 'rb'))
 
-    for i in range(len(b_o_ts)):  # For all trajectories in the behavior dataset
+    for i in range(len(b_o_ts_s0)):  # For all trajectories in the behavior dataset
         if i not in behavior_trajectories_matching_cp_ppi.keys(): # No matching trajectories were generated
             continue
         # Get the trajectories that already match
@@ -292,7 +299,6 @@ if __name__ == '__main__':
             continue
         else:
             matched_trajs = behavior_trajectories_matching_cp_ppi[i]
-
             w = 0
             n = 0
             for j in range(len(matched_trajs['ep_returns'])): # First states and rewards already match, we can calculate the weight now
@@ -300,15 +306,14 @@ if __name__ == '__main__':
                 traj = matched_trajs['states'][j]
                 traj_actions = matched_trajs['actions'][j]
                 traj_rewards = matched_trajs['rewards'][j]
-                w += calculate_cppi_weights(traj, traj_actions, traj_rewards,b_o_ts[i], b_o_as[i], b_o_rs[i], target_policy, behavior_policy)
+                w += calculate_cppi_weights(traj, traj_actions, traj_rewards,b_o_ts_s0[i], b_o_as_s0[i], b_o_rs_s0[i], target_policy, behavior_policy)
                 # w += calculate_ips_product(traj, traj_actions, traj_rewards, target_policy, behavior_policy) * calculate_ips_product(b_o_ts[i], b_o_as[i], b_o_rs[i], target_policy,behavior_policy)
             w/= len(matched_trajs['ep_returns']) # TODO: the above calculation always returns 1?
             weights += [w]
     weights = np.asarray(weights) / np.sum(weights)
-
     all_weights = []
     scores = []
-    for i in range(len(b_o_rs)):
+    for i in range(len(b_o_rs_s0)):
         if i not in behavior_trajectories_matching_cp_ppi.keys(): # No matching trajectories were generated
             continue
         if len(behavior_trajectories_matching_cp_ppi[i]['ep_returns']) == 0:  # No matched trajectories
@@ -321,14 +326,14 @@ if __name__ == '__main__':
             # For every trajectory that matched
             E_diff_rewards = 0
             for j in range(len(matched_trajectories['ep_returns'])):
-                E_diff_rewards += (np.abs(b_o_rs[i] - matched_trajectories['ep_returns'][j]))
+                E_diff_rewards += (np.abs(b_o_rs_s0[i] - matched_trajectories['ep_returns'][j]))
             E_diff_rewards /= len(matched_trajectories['ep_returns'])
             all_weights.append(weights[i])
             scores.append(E_diff_rewards)
 
     quantiles = weighted_quantile(scores, [1 - alpha, alpha], all_weights)
 
-    print("CP-PPI: pi_b=" + str(pi_b) + " pi_e=" + str(pi_e) + " Interval: (" + str(first_term - quantiles[0]) + ", " + str((first_term - quantiles[1])) + ")")
+    print("CP-PPI: pi_b=" + str(pi_b) + " pi_e=" + str(pi_e) + " Interval: (" + str(first_term - quantiles[0]) + ", " + str((first_term + quantiles[1])) + ")")
 
 
 
