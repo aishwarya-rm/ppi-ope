@@ -215,6 +215,8 @@ if __name__ == '__main__':
     # Learn the policies
     behavior_dataset = pickle.load(open('mimic_iv_behavior_trajectories.pkl', 'rb'))
     target_dataset = pickle.load(open('mimic_iv_target_trajectories.pkl', 'rb'))
+
+    skip_list = pickle.load(open('skip_list.pkl', 'rb'))
     obs_mean = behavior_dataset['observations'].mean(0).astype(np.float32)
     obs_std = behavior_dataset['observations'].std(0).astype(np.float32)
     rew_mean = behavior_dataset['rewards'].mean()
